@@ -1,0 +1,73 @@
+{
+    "name": "@rafaelgdn/browser-scraper",
+    "version": "0.4.0",
+    "description": "CDP-first browser automation library with closed Shadow DOM access, profile seeding, and antibot-oriented features",
+    "author": "Rafael",
+    "license": "PolyForm-Noncommercial-1.0.0",
+    "packageManager": "pnpm@10.28.1",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "default": "./dist/index.js"
+        }
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/rafaelgdn/browser-scraper.git"
+    },
+    "homepage": "https://github.com/rafaelgdn/browser-scraper#readme",
+    "bugs": {
+        "url": "https://github.com/rafaelgdn/browser-scraper/issues"
+    },
+    "publishConfig": {
+        "access": "public"
+    },
+    "keywords": [
+        "browser",
+        "scraper",
+        "scraping",
+        "cdp",
+        "chrome-devtools-protocol",
+        "shadow-dom",
+        "cloudflare",
+        "turnstile",
+        "automation"
+    ],
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
+        "check": "tsc -p tsconfig.json --noEmit",
+        "example:basic": "tsx examples/basic.ts",
+        "example:stealth": "tsx examples/stealth-check.ts",
+        "example:keyboard": "tsx examples/keyboard-check.ts",
+        "example:api": "tsx examples/api-check.ts",
+        "example:webgl": "tsx examples/webgl-check.ts",
+        "example:detection": "tsx examples/detection-test.ts",
+        "example:cloudflare": "tsx examples/cloudflare-turnstile.ts",
+        "example:cloudflare-click": "tsx examples/cloudflare-turnstile-click.ts"
+    },
+    "engines": {
+        "node": ">=20.0.0"
+    },
+    "dependencies": {
+        "better-sqlite3": "^11.9.1",
+        "ws": "^8.18.1"
+    },
+    "devDependencies": {
+        "@types/better-sqlite3": "^7.6.12",
+        "@types/node": "^22.15.17",
+        "@types/ws": "^8.18.1",
+        "tsx": "^4.19.3",
+        "typescript": "^5.8.3"
+    },
+    "pnpm": {
+        "onlyBuiltDependencies": [
+            "better-sqlite3",
+            "esbuild"
+        ]
+    }
+}
