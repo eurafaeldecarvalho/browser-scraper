@@ -55,6 +55,15 @@ export class Tab {
     await this._cdp.send("Page.setLifecycleEventsEnabled", { enabled: true });
     await this._cdp.send("DOM.enable");
     await this._cdp.send("Network.enable");
+    // Force the page to always report focus + "visible". Without a window
+    // manager (e.g. headful under Xvfb) the OS never grants focus, so
+    // document.hasFocus() is false and document.visibilityState can be
+    // "hidden". Invisible reCAPTCHA and other focus-gated widgets stall in that
+    // state. setFocusEmulationEnabled makes the renderer behave as if the page
+    // is always focused/foreground. Best-effort: ignore if unsupported.
+    await this._cdp
+      .send("Emulation.setFocusEmulationEnabled", { enabled: true })
+      .catch(() => {});
     // NOTE: Runtime.enable is intentionally NOT called. Anti-bot vendors
     // (Cloudflare, DataDome, Kasada) detect its use as an automation signal.
     // All JS runs through Page.createIsolatedWorld + Runtime.evaluate(contextId),
