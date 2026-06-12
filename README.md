@@ -57,7 +57,13 @@ WebRTC is left enabled (fully disabling it is itself an anomaly) but locked down
 ## Install
 
 ```bash
-pnpm install
+npm install @rafaelgdn/browser-scraper
+```
+
+or:
+
+```bash
+pnpm add @rafaelgdn/browser-scraper
 ```
 
 If `pnpm` blocks native build scripts, run:
@@ -183,16 +189,16 @@ await element.screenshot({ path: "element.png" });
 
 ## Publish
 
-Build the package first:
+Confirm the next version is not published yet:
 
 ```bash
-pnpm build
+npm view @rafaelgdn/browser-scraper version
 ```
 
-Inspect the publishable tarball locally:
+Build and validate the publishable tarball:
 
 ```bash
-pnpm pack
+pnpm run release:check
 ```
 
 Log into npm:

@@ -36,11 +36,16 @@
         "automation"
     ],
     "files": [
-        "dist"
+        "dist",
+        "LICENSE"
     ],
     "scripts": {
-        "build": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\" && tsc -p tsconfig.json",
-        "check": "tsc -p tsconfig.json --noEmit",
+        "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+        "build": "node -e \"const path = require('node:path'); require(path.join(path.dirname(process.env.npm_package_json), 'scripts/run-tsc.cjs'))('build')\"",
+        "check": "node -e \"const path = require('node:path'); require(path.join(path.dirname(process.env.npm_package_json), 'scripts/run-tsc.cjs'))('check')\"",
+        "prepack": "node -e \"const path = require('node:path'); require(path.join(path.dirname(process.env.npm_package_json), 'scripts/verify-dist.cjs'))\"",
+        "pack:check": "npm pack --dry-run",
+        "release:check": "npm publish --dry-run",
         "example:basic": "tsx examples/basic.ts",
         "example:stealth": "tsx examples/stealth-check.ts",
         "example:keyboard": "tsx examples/keyboard-check.ts",
