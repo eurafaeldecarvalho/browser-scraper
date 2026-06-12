@@ -8,6 +8,7 @@ type KeyDescriptor = {
   code: string;
   keyCode: number;
   text?: string;
+  shifted?: boolean;
 };
 
 // Minimal US-layout table for non-printable / named keys. Printable characters
@@ -33,6 +34,48 @@ const NAMED_KEYS: Record<string, KeyDescriptor> = {
   Meta: { key: "Meta", code: "MetaLeft", keyCode: 91 },
 };
 
+// US-layout virtual-key codes for printable symbols, mirroring Puppeteer's
+// USKeyboardLayout. Deriving keyCode from charCodeAt is WRONG for symbols:
+// '('.charCodeAt(0) === 40 === ArrowDown's keyCode, '.' === 46 === Delete,
+// '&' === 38 === ArrowUp — pages that read event.keyCode (autocompletes,
+// dropdown menus) interpret those keystrokes as navigation and corrupt the
+// typed value. keyCode must be the VK code of the PHYSICAL key instead.
+const SYMBOL_KEYS: Record<string, { code: string; keyCode: number; shifted?: boolean }> = {
+  ";": { code: "Semicolon", keyCode: 186 },
+  "=": { code: "Equal", keyCode: 187 },
+  ",": { code: "Comma", keyCode: 188 },
+  "-": { code: "Minus", keyCode: 189 },
+  ".": { code: "Period", keyCode: 190 },
+  "/": { code: "Slash", keyCode: 191 },
+  "`": { code: "Backquote", keyCode: 192 },
+  "[": { code: "BracketLeft", keyCode: 219 },
+  "\\": { code: "Backslash", keyCode: 220 },
+  "]": { code: "BracketRight", keyCode: 221 },
+  "'": { code: "Quote", keyCode: 222 },
+  ")": { code: "Digit0", keyCode: 48, shifted: true },
+  "!": { code: "Digit1", keyCode: 49, shifted: true },
+  "@": { code: "Digit2", keyCode: 50, shifted: true },
+  "#": { code: "Digit3", keyCode: 51, shifted: true },
+  $: { code: "Digit4", keyCode: 52, shifted: true },
+  "%": { code: "Digit5", keyCode: 53, shifted: true },
+  "^": { code: "Digit6", keyCode: 54, shifted: true },
+  "&": { code: "Digit7", keyCode: 55, shifted: true },
+  "*": { code: "Digit8", keyCode: 56, shifted: true },
+  "(": { code: "Digit9", keyCode: 57, shifted: true },
+  ":": { code: "Semicolon", keyCode: 186, shifted: true },
+  "+": { code: "Equal", keyCode: 187, shifted: true },
+  "<": { code: "Comma", keyCode: 188, shifted: true },
+  _: { code: "Minus", keyCode: 189, shifted: true },
+  ">": { code: "Period", keyCode: 190, shifted: true },
+  "?": { code: "Slash", keyCode: 191, shifted: true },
+  "~": { code: "Backquote", keyCode: 192, shifted: true },
+  "{": { code: "BracketLeft", keyCode: 219, shifted: true },
+  "|": { code: "Backslash", keyCode: 220, shifted: true },
+  "}": { code: "BracketRight", keyCode: 221, shifted: true },
+  '"': { code: "Quote", keyCode: 222, shifted: true },
+  " ": { code: "Space", keyCode: 32 },
+};
+
 // Resolves a single printable character or a named key into a full descriptor
 // with the code/keyCode that a real keyboard would report.
 export function deriveKey(key: string): KeyDescriptor {
@@ -52,15 +95,21 @@ export function deriveKey(key: string): KeyDescriptor {
   }
 
   if (char >= "A" && char <= "Z") {
-    return { key: char, code: `Key${char}`, keyCode: char.charCodeAt(0), text: char };
+    return { key: char, code: `Key${char}`, keyCode: char.charCodeAt(0), text: char, shifted: true };
   }
 
   if (char >= "0" && char <= "9") {
     return { key: char, code: `Digit${char}`, keyCode: char.charCodeAt(0), text: char };
   }
 
-  // Any other printable symbol: dispatch via text, keyCode best-effort.
-  return { key: char, code: "", keyCode: char.charCodeAt(0), text: char };
+  const symbol = SYMBOL_KEYS[char];
+  if (symbol) {
+    return { key: char, code: symbol.code, keyCode: symbol.keyCode, text: char, shifted: symbol.shifted };
+  }
+
+  // Unknown printable char (accents, unicode): dispatch via text with keyCode 0.
+  // NEVER fall back to charCodeAt — it collides with navigation-key codes.
+  return { key: char, code: "", keyCode: 0, text: char };
 }
 
 export class Keyboard {
@@ -112,6 +161,7 @@ export class Keyboard {
         code: descriptor.code,
         windowsVirtualKeyCode: descriptor.keyCode,
         nativeVirtualKeyCode: descriptor.keyCode,
+        modifiers: descriptor.shifted ? 8 : 0,
         ...(descriptor.text ? { text: descriptor.text, unmodifiedText: descriptor.text } : {}),
       },
       this._session_id,
@@ -129,6 +179,7 @@ export class Keyboard {
         code: descriptor.code,
         windowsVirtualKeyCode: descriptor.keyCode,
         nativeVirtualKeyCode: descriptor.keyCode,
+        modifiers: descriptor.shifted ? 8 : 0,
       },
       this._session_id,
     );
