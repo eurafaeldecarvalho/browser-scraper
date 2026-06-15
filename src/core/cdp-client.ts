@@ -29,7 +29,11 @@ export class CDPClient {
   private _message_id = 0;
   private _pending_commands = new Map<number, PendingCommand>();
   private _event_handlers = new Map<string, CDPEventHandler[]>();
+  private _disconnect_handlers: Array<(error: CDPError) => void> = [];
   private _connected = false;
+  // Guards against firing the disconnect path twice: a dying socket emits
+  // 'error' first and then 'close', and a graceful disconnect() also closes.
+  private _disconnect_notified = false;
 
   constructor(ws_url: string) {
     this.ws_url = ws_url;
@@ -63,18 +67,23 @@ export class CDPClient {
     });
 
     this._connected = true;
+    this._disconnect_notified = false;
 
     this._ws.on("message", (message: RawData) => {
       void this._handle_message(message.toString());
     });
 
     this._ws.on("close", () => {
-      this._connected = false;
-      this._reject_pending(new CDPError(-1, "CDP WebSocket connection closed"));
+      this._handle_disconnect(new CDPError(-1, "CDP WebSocket connection closed"));
     });
 
-    this._ws.on("error", () => {
-      this._connected = false;
+    this._ws.on("error", (error: Error) => {
+      // A mid-run Chrome death surfaces HERE first (before 'close'). Without
+      // rejecting the in-flight commands they hang until their 30s timeout, and
+      // an unhandled 'error' on the socket can take down the whole Node process.
+      // Reject pending fast with a typed error and notify disconnect listeners
+      // so the caller can fail ONE run gracefully instead of stalling/crashing.
+      this._handle_disconnect(new CDPError(-1, `CDP WebSocket error: ${error?.message ?? String(error)}`));
     });
   }
 
@@ -85,6 +94,9 @@ export class CDPClient {
 
     const ws = this._ws;
     this._connected = false;
+    // A graceful disconnect is EXPECTED, not a crash: mark it handled first so
+    // the resulting 'close' event does not fire the onDisconnect listeners.
+    this._disconnect_notified = true;
     this._ws = null;
 
     await new Promise<void>((resolve) => {
@@ -94,6 +106,42 @@ export class CDPClient {
     });
 
     this._reject_pending(new CDPError(-1, "CDP connection closed"));
+  }
+
+  // Registers a callback fired ONCE when the CDP transport dies unexpectedly
+  // (socket 'error' or 'close' that wasn't a graceful disconnect()). Lets
+  // Tab/Browser surface a mid-run Chrome death as a recoverable, typed failure
+  // for the current operation instead of a 30s hang or an unhandled socket error.
+  onDisconnect(handler: (error: CDPError) => void): void {
+    this._disconnect_handlers.push(handler);
+  }
+
+  offDisconnect(handler: (error: CDPError) => void): void {
+    this._disconnect_handlers = this._disconnect_handlers.filter((candidate) => candidate !== handler);
+  }
+
+  get connected(): boolean {
+    return this._connected;
+  }
+
+  // Fired at most once per connection lifetime (a dying socket emits 'error'
+  // then 'close'). Marks disconnected, rejects every in-flight command so
+  // callers fail fast with a typed error, then notifies disconnect listeners.
+  private _handle_disconnect(error: CDPError): void {
+    this._connected = false;
+    if (this._disconnect_notified) {
+      this._reject_pending(error);
+      return;
+    }
+    this._disconnect_notified = true;
+    this._reject_pending(error);
+    for (const handler of this._disconnect_handlers) {
+      try {
+        handler(error);
+      } catch {
+        // A listener error must never mask the disconnect itself.
+      }
+    }
   }
 
   async send(

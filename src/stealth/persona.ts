@@ -122,10 +122,16 @@ function chPlatformName(platform: PersonaPlatform): string {
 //    "Browser" field. Real Chrome's fullVersionList carries the COMPLETE 4-part
 //    build; the reduced UA only carries "X.0.0.0", so a fullVersionList of
 //    "X.0.0.0" is an impossible build number and a tell. We thread the real
-//    build in. The GREASE ("Not?A_Brand") entry legitimately is "8.0.0.0".
+//    build in.
+//  - liveGrease is the REAL GREASE brand (the "Not...Brand" entry) read once from
+//    the running browser's navigator.userAgentData. The GREASE token + version
+//    ROTATE per Chrome build, so any hard-coded value goes stale and matches no
+//    real Chrome; passing the live value keeps it correct version-independently.
+//    The fallback below is only used if the live read failed.
 export function buildUserAgentMetadata(
   userAgent: string,
   fullVersion: string | null = null,
+  liveGrease: { brand: string; version: string } | null = null,
 ): Record<string, unknown> {
   const major = userAgent.match(/Chrome\/(\d+)/)?.[1] ?? "120";
   const platform = platformFromUA(userAgent);
@@ -139,16 +145,28 @@ export function buildUserAgentMetadata(
       ? fullVersion
       : `${major}.0.0.0`;
 
+  // Live GREASE entry when captured from the real browser; otherwise a
+  // last-resort fallback (the GREASE token rotates per Chrome build, so prefer
+  // ALWAYS passing liveGrease). Guard defensively: _capture_grease stores
+  // String(version ?? "") so an empty (non-null) string would slip past `??` and
+  // yield brands version "" + a malformed fullVersionList ".0.0.0".
+  const live_brand = liveGrease?.brand?.trim();
+  const live_ver = liveGrease?.version?.trim();
+  const grease_brand = live_brand || "Not)A;Brand";
+  const grease_major = live_ver && /^\d+$/.test(live_ver) ? live_ver : "99";
+  // Chrome's GREASE fullVersionList entry is "<greaseMajor>.0.0.0".
+  const grease_full = `${grease_major}.0.0.0`;
+
   const brands = [
     { brand: "Chromium", version: major },
     { brand: "Google Chrome", version: major },
-    { brand: "Not?A_Brand", version: "8" },
+    { brand: grease_brand, version: grease_major },
   ];
 
   const full_version_list = [
     { brand: "Chromium", version: real_full },
     { brand: "Google Chrome", version: real_full },
-    { brand: "Not?A_Brand", version: "8.0.0.0" },
+    { brand: grease_brand, version: grease_full },
   ];
 
   let model = "";

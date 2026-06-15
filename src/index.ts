@@ -3,8 +3,11 @@ export {
   BrowserError,
   STEALTH_FLAGS,
   LAMBDA_FLAGS,
+  SHELL_WEBGL_FLAGS,
   DEFAULT_WEBGL_VENDOR,
   DEFAULT_WEBGL_RENDERER,
+  resolveSparticuz,
+  type ResolvedChromium,
 } from "./core/browser";
 export { Tab, Dialog, type WaitUntil, type TabStealth } from "./core/tab";
 export { Element } from "./core/element";
@@ -27,4 +30,4 @@ export { buildEvasionSource, type EvasionOptions } from "./stealth/evasions";
 export { ShadowRootAccessor } from "./shadow/shadow-root";
 export { findChrome, getChromeVersion } from "./utils/chrome-finder";
 
-export const __version__ = "0.5.0";
+export const __version__ = "0.6.0";

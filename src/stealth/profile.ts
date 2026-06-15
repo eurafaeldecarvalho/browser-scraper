@@ -56,6 +56,10 @@ export type CookieSeed = {
   path: string;
   secure: boolean;
   httpOnly: boolean;
+  // Unix seconds. Set by cookieSeeds() so a CDP Tab.setCookies() injection is a
+  // PERSISTENT cookie (a missing expires makes CDP create a session cookie that
+  // is lost on restart — diverging from the old 1-year SQLite seeding).
+  expires?: number;
 };
 
 export class ProfileManager {
@@ -141,11 +145,31 @@ export class ProfileManager {
     }
   }
 
+  // The default cookie bundle (low-key, non-identity values for popular sites),
+  // stamped with a ~1-year expiry so a CDP `Tab.setCookies()` injection persists
+  // (rather than becoming a session cookie). Pass to `Tab.setCookies()` — the
+  // supported, WORKING path on Chrome >=80. Prefer this over seedCookies() below.
+  cookieSeeds(): CookieSeed[] {
+    const expires = Math.floor(Date.now() / 1000) + 365 * 24 * 3600;
+    return this._generate_default_cookies().map((cookie) => ({ ...cookie, expires }));
+  }
+
+  /**
+   * @deprecated INERT on Chrome >=80. This writes the cookie `value` in plaintext
+   * with an empty `encrypted_value`, but modern Chrome reads cookies from the
+   * OSCrypt-encrypted `encrypted_value` and ignores the plaintext field, so the
+   * seeded cookies are dropped at load (and a plaintext Cookies DB is a forensic
+   * anomaly). Inject cookies at runtime via `Tab.setCookies()` (CDP) instead,
+   * using `cookieSeeds()` for the default bundle. Retained only for compatibility.
+   */
   seedCookies({
     cookies = null,
   }: {
     cookies?: CookieSeed[] | null;
   } = {}): void {
+    console.warn(
+      "[browser-scraper] ProfileManager.seedCookies() is deprecated and INERT on Chrome >=80 (it writes a plaintext `value` that modern Chrome ignores in favor of the OSCrypt `encrypted_value`), and it materializes a forensically-anomalous plaintext Cookies DB on disk. Inject cookies at runtime via `tab.setCookies({ cookies })` (CDP, encrypted with the live profile key); use ProfileManager.cookieSeeds() for the default bundle.",
+    );
     const generated_cookies = cookies ?? this._generate_default_cookies();
     const cookies_db = join(this.default_dir, "Cookies");
     const db = new Database(cookies_db);

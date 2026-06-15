@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,6 +35,18 @@ export const STEALTH_FLAGS = [
 // genuinely cannot run. Enabled via `lambda: true` (or pass through extraArgs).
 export const LAMBDA_FLAGS = ["--no-sandbox", "--disable-dev-shm-usage"];
 
+// Software-WebGL flags for a GPU-less host running chrome-headless-shell. Chrome
+// 137+ removed the automatic SwiftShader fallback, so without these
+// getContext('webgl') returns null on a GPU-less host — itself a headless tell,
+// and it makes any WebGL identity inert (no context to read the value from).
+// @sparticuz/chromium already sets equivalent flags in its default graphicsMode;
+// these are added only when MISSING so the lib owns one coherent WebGL policy.
+export const SHELL_WEBGL_FLAGS = ["--use-gl=angle", "--use-angle=swiftshader-webgl", "--enable-unsafe-swiftshader"];
+
+// How much of Chrome's stderr tail to retain for a launch-failure diagnostic
+// (UTF-16 code units, not bytes — an approximation sufficient for a diagnostic).
+const STDERR_RING_CHARS = 16_384;
+
 // WebRTC IP-handling policy applied at launch. Fully disabling WebRTC is an
 // anomaly fingerprinters flag (real Chrome has it working), so instead we keep
 // it present and prevent IP leaks: behind a proxy, force all UDP through the
@@ -50,6 +62,39 @@ export class BrowserError extends Error {
     super(message);
     this.name = "BrowserError";
   }
+}
+
+export type ResolvedChromium = {
+  executablePath: string;
+  args: string[];
+  // chrome-headless-shell is already headless ('shell' mode); the Browser must
+  // NOT add --headless=new on top of it.
+  shellMode: boolean;
+};
+
+// Resolves @sparticuz/chromium (an OPTIONAL dependency) for AWS Lambda ZIP
+// deployments: returns its Lambda-tuned executablePath + args. The package ships
+// chrome-headless-shell (already headless='shell'), so shellMode is true and the
+// Browser must not re-apply a headless flag. Imported dynamically (variable
+// specifier) so the ~150MB binary is never required off-Lambda and the package
+// can stay an optional dep kept EXTERNAL by the bundler (it resolves its binary
+// by relative path). Throws a clear error if the optional dep is absent.
+//
+//   const browser = new Browser({ chromium: await resolveSparticuz(), proxy });
+export async function resolveSparticuz(): Promise<ResolvedChromium> {
+  const pkg = "@sparticuz/chromium";
+  let mod: any;
+  try {
+    mod = await import(pkg);
+  } catch {
+    throw new BrowserError(
+      "resolveSparticuz() needs the optional dependency '@sparticuz/chromium'. Install it (pin the version to your Chromium target) and keep it EXTERNAL in your bundler — it resolves its bundled binary by relative path.",
+    );
+  }
+  const chromium = mod?.default ?? mod;
+  const executablePath: string = await chromium.executablePath();
+  const args: string[] = Array.isArray(chromium.args) ? chromium.args : [];
+  return { executablePath, args, shellMode: true };
 }
 
 type StealthScreen = { width: number; height: number };
@@ -102,6 +147,32 @@ type BrowserOptions = {
   // Warn once when launching with no proxy — direct datacenter egress is the
   // dominant detection vector regardless of fingerprint. Default true.
   warnOnDirectEgress?: boolean;
+  // Browser channel. 'headless-shell' marks the binary as chrome-headless-shell
+  // (e.g. @sparticuz/chromium on Lambda): it is ALREADY headless ('shell' mode),
+  // so the lib never adds --headless=new on top of it, owns the software-WebGL
+  // flags (SHELL_WEBGL_FLAGS), ensures HOME/XDG/user-data dirs exist, points the
+  // session bus at /dev/null, and auto-applies the shell-specific JS shims
+  // (window.chrome, navigator.connection) that a real headful Chrome has natively.
+  channel?: "chrome" | "headless-shell" | null;
+  // Pre-resolved chromium (e.g. `await resolveSparticuz()`): its executablePath
+  // becomes chromePath and its args are merged at launch; shellMode implies
+  // channel:'headless-shell'. Lets a Lambda consumer wire @sparticuz/chromium in
+  // one line without hand-managing the binary path, args, and headless flag.
+  chromium?: ResolvedChromium | null;
+  // Receives Chrome's stderr in raw chunks (the launch/crash cause; a chunk may
+  // span or split lines). Without this the process still captures a stderr ring
+  // buffer that is attached to the BrowserError on a launch timeout, so a Lambda
+  // OOM/seccomp death is no longer a bare "Timeout waiting for Chrome to start".
+  onStderr?: ((chunk: string) => void) | null;
+  // OPT-IN, OFF by default. CDP Input events historically report
+  // screenX==clientX / screenY==clientY (Chromium bug 40280325) instead of true
+  // global screen coords — an automation tell some checks (e.g. Turnstile) read
+  // even though isTrusted is true. Setting an explicit {x,y} offset installs
+  // MouseEvent.screenX/screenY getters returning clientX+x / clientY+y.
+  // IMPORTANT: a ~Sept-2025 Chromium fix may already make your build report
+  // correct coords — VERIFY empirically on your exact binary first; applying an
+  // offset over an already-correct value just creates a NEW, different tell.
+  screenCoordOffset?: { x: number; y: number } | null;
 };
 
 // Backwards-compatible Windows GPU identity (still exported). The default is now
@@ -134,6 +205,9 @@ export class Browser {
   evasions: boolean;
   lambda: boolean;
   warnOnDirectEgress: boolean;
+  channel: "chrome" | "headless-shell";
+  onStderr: ((chunk: string) => void) | null;
+  screenCoordOffset: { x: number; y: number } | null;
 
   private _process: ChildProcess | null = null;
   private _temp_dir: string | null = null;
@@ -143,6 +217,14 @@ export class Browser {
   private _browser_version: string | null = null;
   private _auto_geo_resolved = false;
   private _tabs: Tab[] = [];
+  // True when running chrome-headless-shell (channel / resolved chromium): the
+  // binary is already headless and the lib applies the shell-specific policy.
+  private _shell_mode = false;
+  // Extra launch args from a resolved chromium (e.g. @sparticuz/chromium.args).
+  private _chromium_args: string[] = [];
+  // Rolling tail of Chrome's stderr (last ~16KB) so a launch failure can report
+  // the REAL cause instead of a generic timeout.
+  private _stderr_ring = "";
 
   constructor(
     chrome_path_or_options: string | BrowserOptions | null = null,
@@ -161,7 +243,8 @@ export class Browser {
       auto_seed,
     );
 
-    this.chromePath = options.chromePath ?? findChrome() ?? "";
+    const resolvedChromium = options.chromium ?? null;
+    this.chromePath = resolvedChromium?.executablePath ?? options.chromePath ?? findChrome() ?? "";
     if (!this.chromePath) {
       throw new BrowserError("Could not find Chrome. Please install Chrome or provide path.");
     }
@@ -186,6 +269,11 @@ export class Browser {
     this.evasions = options.evasions ?? true;
     this.lambda = options.lambda ?? false;
     this.warnOnDirectEgress = options.warnOnDirectEgress ?? true;
+    this.channel = options.channel ?? (resolvedChromium?.shellMode ? "headless-shell" : "chrome");
+    this._shell_mode = this.channel === "headless-shell" || Boolean(resolvedChromium?.shellMode);
+    this._chromium_args = resolvedChromium?.args ?? [];
+    this.onStderr = options.onStderr ?? null;
+    this.screenCoordOffset = options.screenCoordOffset ?? null;
 
     // An unmapped geoCountry with no explicit timezone/locale would silently
     // apply NO geo emulation — leaving UTC on a foreign IP, a hard tell. Surface
@@ -266,6 +354,11 @@ export class Browser {
       // explicit screen is given so the geometry coherence still applies.
       screen: this.screen ?? this.windowSize,
       evasions: this.evasions,
+      // chrome-headless-shell lacks surfaces a real headful Chrome has
+      // (window.chrome, a non-zero navigator.connection.rtt). Tell the tab to
+      // apply the conditional shell shims when running that binary.
+      shellMode: this._shell_mode,
+      screenCoordOffset: this.screenCoordOffset,
     };
   }
 
@@ -281,6 +374,12 @@ export class Browser {
 
     if (this.autoSeed && this._temp_dir) {
       this._seed_profile();
+    }
+
+    // chrome-headless-shell on Lambda needs HOME + the XDG dirs to exist and be
+    // writable (they live under the ephemeral /tmp and vanish each cold start).
+    if (this._shell_mode) {
+      await this._ensure_browser_dirs();
     }
 
     if (this.warnOnDirectEgress && !this.proxy) {
@@ -307,7 +406,19 @@ export class Browser {
       args.push(`--user-agent=${this.userAgent}`);
     }
 
-    if (this.headless) {
+    if (this._shell_mode) {
+      // chrome-headless-shell is ALREADY headless ('shell' mode): never add
+      // --headless=new on top (that flag exists only in the full browser and
+      // would conflict). Own the software-WebGL flags so a GPU-less host still
+      // yields a (SwiftShader) context — added only when neither these args nor
+      // the resolved chromium args already carry them, to avoid duplicates.
+      for (const flag of SHELL_WEBGL_FLAGS) {
+        const key = flag.split("=")[0];
+        if (!args.some((a) => a.startsWith(key)) && !this._chromium_args.some((a) => a.startsWith(key))) {
+          args.push(flag);
+        }
+      }
+    } else if (this.headless) {
       args.push("--headless=new");
       // Chrome 137+ removed the automatic SwiftShader WebGL fallback: on a
       // GPU-less host getContext('webgl') returns null — itself a headless tell,
@@ -317,21 +428,64 @@ export class Browser {
       args.push("--enable-unsafe-swiftshader");
     }
 
-    if (this.lambda) {
-      args.push(...LAMBDA_FLAGS);
+    // --no-sandbox / --disable-dev-shm-usage: required by lambda:true AND implied
+    // by shell mode (a chrome-headless-shell binary is a constrained/sandboxless
+    // deploy by definition). Deduped against the resolved chromium args so
+    // @sparticuz/chromium (which already carries them) isn't given duplicates.
+    if (this.lambda || this._shell_mode) {
+      for (const flag of LAMBDA_FLAGS) {
+        const key = flag.split("=")[0];
+        if (!args.some((a) => a.startsWith(key)) && !this._chromium_args.some((a) => a.startsWith(key))) {
+          args.push(flag);
+        }
+      }
     }
 
     if (this.proxy) {
       args.push(`--proxy-server=${this.proxy}`);
     }
 
-    args.push(...this.extraArgs, "about:blank");
+    // Resolved-chromium args (e.g. @sparticuz/chromium's Lambda-tuned set) come
+    // before the caller's extraArgs so an explicit extraArg always wins.
+    args.push(...this._chromium_args, ...this.extraArgs, "about:blank");
 
     this._process = spawn(this.chromePath, args, {
-      stdio: "ignore",
+      // Capture stderr (the real launch/crash cause) instead of /dev/null, so a
+      // Lambda seccomp/OOM death surfaces in the BrowserError rather than a bare
+      // "Timeout waiting for Chrome to start".
+      stdio: ["ignore", "ignore", "pipe"],
+      env: this._spawn_env(),
     });
+    this._attach_stderr_capture();
 
-    this._ws_endpoint = await this._get_ws_endpoint();
+    try {
+      this._ws_endpoint = await this._get_ws_endpoint();
+    } catch (error) {
+      // Launch failed (e.g. Chrome died under a Lambda seccomp/OOM). Tear down the
+      // half-spawned process + temp profile so a retry starts clean and neither
+      // leaks. The thrown BrowserError already carries the captured stderr tail.
+      await this._teardown_failed_launch();
+      throw error;
+    }
+  }
+
+  // Minimal teardown for a launch that never reached a live CDP endpoint: SIGKILL
+  // the process and drop the temp profile (only the one WE created), so a caller
+  // retry re-creates a clean profile and nothing is leaked.
+  private async _teardown_failed_launch(): Promise<void> {
+    if (this._process) {
+      try {
+        this._process.kill("SIGKILL");
+      } catch {
+        // already gone
+      }
+      this._process = null;
+    }
+    if (this._temp_dir) {
+      await rm(this._temp_dir, { recursive: true, force: true }).catch(() => {});
+      this._temp_dir = null;
+      this.userDataDir = null;
+    }
   }
 
   async close(): Promise<void> {
@@ -537,7 +691,57 @@ export class Browser {
       await delay(200);
     }
 
-    throw new BrowserError("Timeout waiting for Chrome to start");
+    const tail = this._stderr_ring.trim();
+    throw new BrowserError(
+      `Timeout waiting for Chrome to start.${tail ? ` Chrome stderr (tail):\n${tail}` : " (no stderr captured)"}`,
+    );
+  }
+
+  // Child env for the spawned Chrome. In shell mode, silences chrome-headless-
+  // shell's libdbus autolaunch (there is no dbus-daemon on the Lambda runtime)
+  // by pointing the session bus at /dev/null, unless the caller already set it.
+  private _spawn_env(): NodeJS.ProcessEnv {
+    if (!this._shell_mode) {
+      return process.env;
+    }
+    return {
+      ...process.env,
+      DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS ?? "/dev/null",
+    };
+  }
+
+  // Buffers Chrome's stderr into a rolling tail (the real launch/crash cause) so
+  // a startup failure reports WHY instead of a bare timeout, and forwards each
+  // chunk to an optional onStderr hook. Replaces the old stdio:'ignore' that sent
+  // the crash cause to /dev/null (a Lambda seccomp/OOM death was invisible).
+  private _attach_stderr_capture(): void {
+    const stderr = this._process?.stderr;
+    if (!stderr) {
+      return;
+    }
+    stderr.setEncoding("utf-8");
+    stderr.on("data", (chunk: string) => {
+      this._stderr_ring = (this._stderr_ring + chunk).slice(-STDERR_RING_CHARS);
+      if (this.onStderr) {
+        try {
+          this.onStderr(chunk);
+        } catch {
+          // A logging hook must never break the launch.
+        }
+      }
+    });
+    stderr.on("error", () => {});
+  }
+
+  // Best-effort: create HOME / XDG_CONFIG_HOME / XDG_CACHE_HOME when they are set
+  // (on Lambda they point into /tmp and are recreated each cold start). Chrome
+  // aborts early if HOME is unwritable.
+  private async _ensure_browser_dirs(): Promise<void> {
+    for (const dir of [process.env.HOME, process.env.XDG_CONFIG_HOME, process.env.XDG_CACHE_HOME]) {
+      if (dir) {
+        await mkdir(dir, { recursive: true }).catch(() => {});
+      }
+    }
   }
 
   private _seed_profile(): void {
@@ -548,7 +752,12 @@ export class Browser {
     try {
       const profile = new ProfileManager({ profileDir: this.userDataDir });
       profile.seedHistory();
-      profile.seedCookies();
+      // Cookies are deliberately NOT seeded into the SQLite file: Chrome >=80
+      // reads the OSCrypt-encrypted `encrypted_value` and IGNORES a plaintext
+      // `value`, so a file write is inert (and a Cookies DB full of plaintext
+      // values is itself a forensic anomaly if read). Inject a warmed cookie
+      // bundle at RUNTIME via `tab.setCookies()` (CDP, encrypted with the live
+      // profile key) instead — see ProfileManager.cookieSeeds() for the defaults.
     } catch {
     }
   }

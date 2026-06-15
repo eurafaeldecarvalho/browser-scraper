@@ -35,6 +35,13 @@ export type TabStealth = {
   hardwareConcurrency?: number | null;
   screen?: { width: number; height: number } | null;
   evasions?: boolean;
+  // True when the binary is chrome-headless-shell: apply the shell-specific JS
+  // shims (window.chrome, navigator.connection.rtt) that a real headful Chrome
+  // exposes natively but the shell binary lacks.
+  shellMode?: boolean;
+  // OPT-IN MouseEvent.screenX/screenY offset (Chromium bug 40280325). Off unless
+  // an explicit, verified offset is supplied. See Browser.screenCoordOffset.
+  screenCoordOffset?: { x: number; y: number } | null;
 };
 
 export class Tab {
@@ -53,7 +60,15 @@ export class Tab {
   private _webgl: { vendor: string; renderer: string } | null;
   private _webgl_auto: boolean;
   private _webgl_script_id: string | null = null;
+  // True when the WebGL spoof was skipped because no WebGL context is available
+  // (GPU-less host without software-GL flags). Keeps later re-pins from
+  // installing an inert/incoherent override that claims an absent GPU.
+  private _webgl_skipped = false;
   private _stealth: TabStealth;
+  private _shell_mode: boolean;
+  // Real GREASE brand read once from the running browser; threaded into every
+  // userAgentMetadata so the rotating GREASE token is never a stale guess.
+  private _grease: { brand: string; version: string } | null = null;
 
   constructor(ws_url: string, target_info: Record<string, any>, stealth: TabStealth = {}) {
     this.ws_url = ws_url;
@@ -66,6 +81,7 @@ export class Tab {
     this._full_version = stealth.fullVersion ?? null;
     this._webgl = stealth.webgl ?? null;
     this._webgl_auto = stealth.webglAuto ?? false;
+    this._shell_mode = stealth.shellMode ?? false;
   }
 
   async connect(): Promise<void> {
@@ -98,6 +114,7 @@ export class Tab {
       this._on_frame_detached(params as Record<string, any>);
     });
 
+    await this._capture_grease();
     await this._apply_user_agent_override();
     await this._apply_geo();
     await this._apply_hardware_override();
@@ -165,6 +182,41 @@ export class Tab {
     this._execution_context_id = null;
   }
 
+  // Surfaces an unexpected CDP-transport death (mid-run Chrome crash) as a typed
+  // error so a caller can fail THIS run gracefully. The CDP client rejects every
+  // in-flight command on the same event, so awaited operations reject fast
+  // instead of hanging to their 30s timeout.
+  onDisconnect(handler: (error: CDPError) => void): void {
+    this._cdp.onDisconnect(handler);
+  }
+
+  // Reads the REAL GREASE brand (the "Not...Brand" entry) from the running
+  // browser's navigator.userAgentData ONCE, before any UA override is applied,
+  // so the rotating GREASE token threaded into userAgentMetadata matches the
+  // actual Chromium build instead of a stale hard-coded guess. Uses a one-off
+  // Runtime.evaluate in the default context (this is NOT Runtime.enable, which is
+  // the automation tell we avoid). Best-effort; falls back to the persona default.
+  private async _capture_grease(): Promise<void> {
+    try {
+      const result = await this._cdp.send("Runtime.evaluate", {
+        expression:
+          "(()=>{try{return JSON.stringify((navigator.userAgentData&&navigator.userAgentData.brands)||[])}catch(e){return '[]'}})()",
+        returnByValue: true,
+      });
+      const raw = result?.result?.value;
+      const brands = typeof raw === "string" ? JSON.parse(raw) : [];
+      const known = /chromium|google chrome|microsoft edge|opera|brave/i;
+      for (const entry of Array.isArray(brands) ? brands : []) {
+        if (entry && typeof entry.brand === "string" && !known.test(entry.brand)) {
+          this._grease = { brand: entry.brand, version: String(entry.version ?? "") };
+          break;
+        }
+      }
+    } catch {
+      // No grease captured — buildUserAgentMetadata uses its fallback.
+    }
+  }
+
   // Applies a cleaned User-Agent together with matching client-hint metadata.
   // Overriding the UA string alone leaves sec-ch-ua headers reporting
   // "HeadlessChrome"; supplying userAgentMetadata keeps both in sync. Runs
@@ -193,7 +245,7 @@ export class Tab {
     try {
       await this._cdp.send("Network.setUserAgentOverride", {
         userAgent: this._user_agent,
-        userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version),
+        userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version, this._grease),
       });
     } catch (error) {
       if (!(error instanceof CDPError)) {
@@ -212,6 +264,25 @@ export class Tab {
       return;
     }
 
+    // A getParameter override is INERT — and worse, INCOHERENT (it claims a GPU
+    // the page can't instantiate) — when no WebGL context can be created. On a
+    // GPU-less host without the SwiftShader flags, getContext('webgl') is null.
+    // Probe first and skip the spoof (with a warning) instead of installing a lie
+    // nothing backs. With channel:'headless-shell' the lib adds the software-GL
+    // flags, so a SwiftShader context exists and this passes.
+    const has_context = await this._webgl_context_available();
+    if (!has_context) {
+      // Mark skipped so a later setUserAgent OS-switch re-pin doesn't re-install
+      // the inert/incoherent override (context availability is renderer-level and
+      // does not change with the UA).
+      this._webgl_skipped = true;
+      console.warn(
+        "[browser-scraper] WebGL spoof skipped: no WebGL context is available (GPU-less host without software-WebGL flags). The getParameter override would be inert and would claim a GPU the renderer can't instantiate. Use channel:'headless-shell' (or add --enable-unsafe-swiftshader), or drop the WebGL spoof.",
+      );
+      return;
+    }
+    this._webgl_skipped = false;
+
     const { vendor, renderer } = this._webgl;
     const source = build_webgl_override_source(vendor, renderer);
     try {
@@ -220,6 +291,22 @@ export class Tab {
       if (!(error instanceof CDPError)) {
         throw error;
       }
+    }
+  }
+
+  // Probes whether a WebGL rendering context can be created in the current
+  // default context. One-off Runtime.evaluate (this is NOT Runtime.enable).
+  private async _webgl_context_available(): Promise<boolean> {
+    try {
+      const result = await this._cdp.send("Runtime.evaluate", {
+        expression:
+          "(()=>{try{const c=document.createElement('canvas');return !!(c.getContext('webgl')||c.getContext('experimental-webgl'));}catch(e){return false}})()",
+        returnByValue: true,
+      });
+      return Boolean(result?.result?.value);
+    } catch {
+      // If the probe itself fails, don't block the override.
+      return true;
     }
   }
 
@@ -245,7 +332,7 @@ export class Tab {
         await this._cdp.send("Network.setUserAgentOverride", {
           userAgent: this._user_agent,
           acceptLanguage: geo.acceptLanguage,
-          userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version),
+          userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version, this._grease),
         });
       } else if (geo.acceptLanguage) {
         await this._cdp.send("Network.setExtraHTTPHeaders", { headers: { "Accept-Language": geo.acceptLanguage } });
@@ -288,6 +375,11 @@ export class Tab {
       webdriver: true,
       notifications: true,
       screen: this._stealth.screen ?? null,
+      // chrome-headless-shell lacks window.chrome and reports connection.rtt===0;
+      // shim both (conditionally) so the shell binary matches a real headful Chrome.
+      windowChrome: this._shell_mode,
+      connection: this._shell_mode,
+      screenCoordOffset: this._stealth.screenCoordOffset ?? null,
     });
 
     if (!source.trim()) {
@@ -1485,21 +1577,33 @@ export class Tab {
     return data;
   }
 
+  // Injects cookies through Chrome's own cookie store via CDP Network.setCookie.
+  // Prefer this over the pre-launch SQLite seeding: Chrome >=80 reads the
+  // OSCrypt-encrypted `encrypted_value` and IGNORES a plaintext `value`, so a
+  // file-seeded cookie is dropped at load — whereas a CDP-set cookie is encrypted
+  // with the live profile key and actually sticks. The supported way to inject a
+  // warmed-identity cookie bundle (matched to a sticky residential IP) at the
+  // start of a run. Each cookie needs a `domain` (host scope, e.g. ".x.com") or a
+  // `url`; see ProfileManager.cookieSeeds() for the default bundle.
   async setCookies({ cookies }: { cookies: Array<Record<string, any>> }): Promise<void> {
     for (const cookie of cookies) {
       const params: Record<string, unknown> = {
         name: cookie.name ?? "",
         value: cookie.value ?? "",
-        domain: cookie.domain ?? "",
         path: cookie.path ?? "/",
         secure: cookie.secure ?? false,
         httpOnly: cookie.httpOnly ?? false,
       };
 
+      if (cookie.domain !== undefined) {
+        params.domain = cookie.domain;
+      }
+      if (cookie.url !== undefined) {
+        params.url = cookie.url;
+      }
       if (cookie.expires !== undefined) {
         params.expires = cookie.expires;
       }
-
       if (cookie.sameSite !== undefined) {
         params.sameSite = cookie.sameSite;
       }
@@ -1563,6 +1667,30 @@ export class Tab {
     await this._cdp.send("Page.removeScriptToEvaluateOnNewDocument", { identifier });
   }
 
+  // Ambient cursor drift + a little scroll, to run BEFORE a token-minting call
+  // (e.g. grecaptcha.execute()) or a high-value submit. A total absence of prior
+  // pointer/scroll activity reads as a "blind execute" and tanks a reCAPTCHA v3
+  // score; this gives the page a short, non-periodic burst of human-like motion.
+  async ambientActivity({ durationMs = 1200, scroll = true }: { durationMs?: number; scroll?: boolean } = {}): Promise<void> {
+    try {
+      // Seed an initial position so the first drift isn't stuck in the (0,0)
+      // corner when no prior pointer move happened (idle() drifts RELATIVE to the
+      // current point).
+      const [cx, cy] = this.mouse.position;
+      if (cx === 0 && cy === 0) {
+        await this.mouse.moveTo({ x: 300 + Math.round(Math.random() * 600), y: 200 + Math.round(Math.random() * 400) });
+      }
+      await this.mouse.idle({ durationMs });
+      if (scroll) {
+        await this.mouse.scroll({ deltaY: 120 + Math.round(Math.random() * 160) });
+        await this.sleep({ milliseconds: 150 });
+        await this.mouse.scroll({ deltaY: -(60 + Math.round(Math.random() * 80)) });
+      }
+    } catch {
+      // Best-effort: ambient motion failing must never abort the real action.
+    }
+  }
+
   async setExtraHeaders({ headers }: { headers: Record<string, string> }): Promise<void> {
     await this._cdp.send("Network.setExtraHTTPHeaders", { headers });
   }
@@ -1574,7 +1702,7 @@ export class Tab {
     this._user_agent = userAgent;
     await this._cdp.send("Network.setUserAgentOverride", {
       userAgent,
-      userAgentMetadata: buildUserAgentMetadata(userAgent, this._full_version),
+      userAgentMetadata: buildUserAgentMetadata(userAgent, this._full_version, this._grease),
     });
 
     // If the WebGL identity was OS-derived (spoofWebGL) and this UA changes the
@@ -1585,6 +1713,12 @@ export class Tab {
     if (this._webgl_auto && previous_platform !== next_platform) {
       const next = defaultWebglForPlatform(next_platform);
       this._webgl = next;
+      // If the connect-time probe found no WebGL context, keep the spoof OFF on
+      // re-pin too — installing it now would claim a GPU the renderer can't back
+      // (the exact inert/incoherent override the connect path avoided).
+      if (this._webgl_skipped) {
+        return;
+      }
       try {
         if (this._webgl_script_id) {
           await this.removeInitScript({ identifier: this._webgl_script_id });
@@ -1648,7 +1782,7 @@ export class Tab {
       await this._cdp.send("Network.setUserAgentOverride", {
         userAgent: this._user_agent,
         acceptLanguage: accept_language,
-        userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version),
+        userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version, this._grease),
       });
     } else if (accept_language) {
       await this._cdp.send("Network.setExtraHTTPHeaders", { headers: { "Accept-Language": accept_language } });
