@@ -129,7 +129,9 @@ export class Keyboard {
       const [x, y] = getSharedMouse(this._cdp).position;
       await this._cdp.send(
         "Input.dispatchMouseEvent",
-        { type: "mouseMoved", x: Math.trunc(x), y: Math.trunc(y) },
+        // Emit the raw float position (no truncation) to match HumanMouse's
+        // float emission, so the warm pulse doesn't back-jump the cursor.
+        { type: "mouseMoved", x, y },
         this._session_id,
       );
     } catch {
@@ -185,25 +187,67 @@ export class Keyboard {
     );
   }
 
-  // Types a string character-by-character with proper key events and
-  // human-like, slightly jittered delays between keystrokes.
+  // Types a string with realistic per-keystroke dynamics: lognormal dwell (key
+  // hold) and flight (inter-key) times rather than uniform jitter, occasional
+  // longer pauses, and intermittent key ROLLOVER — pressing the next key before
+  // releasing the current one, which is physically real for fast typists and
+  // structurally impossible with a strictly sequential down→up loop.
   async type(text: string, { humanLike = true }: { humanLike?: boolean } = {}): Promise<void> {
     await this._warm_input_pipeline();
 
-    for (const char of text) {
-      await this._press(char);
+    const chars = [...text];
+    for (let index = 0; index < chars.length; index += 1) {
+      const char = chars[index];
+      const next = chars[index + 1];
 
-      if (humanLike) {
-        let current_delay = random_between(50, 150);
-        if (Math.random() < 0.1) {
-          current_delay += random_between(100, 300);
-        }
-        await delay(current_delay);
+      if (!humanLike) {
+        await this._press(char);
+        continue;
       }
+
+      const dwell = lognormal_ms(70, 0.5, 25, 180);
+      const can_roll = Boolean(next) && is_rollable(char) && is_rollable(next) && Math.random() < 0.12;
+
+      await this.down(char);
+      await delay(dwell);
+
+      if (can_roll) {
+        // Overlap: begin the next key before lifting the current one.
+        await this.down(next);
+        await this.up(char);
+        await delay(lognormal_ms(45, 0.5, 15, 120));
+        await this.up(next);
+        index += 1; // consumed `next`
+      } else {
+        await this.up(char);
+      }
+
+      let flight = lognormal_ms(110, 0.45, 40, 260);
+      if (Math.random() < 0.08) {
+        flight += random_between(120, 350); // rare longer pause (thinking)
+      }
+      await delay(flight);
     }
   }
 }
 
 function random_between(min: number, max: number): number {
   return min + Math.random() * (max - min);
+}
+
+// Samples a lognormal-distributed delay in ms (median-centered), clamped to a
+// plausible range. Human keystroke dwell/flight times are right-skewed, which a
+// uniform distribution never reproduces.
+function lognormal_ms(median: number, sigma: number, min: number, max: number): number {
+  const u1 = Math.random() || Number.EPSILON;
+  const u2 = Math.random();
+  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+  const value = Math.exp(Math.log(median) + sigma * z);
+  return Math.max(min, Math.min(max, value));
+}
+
+// Rollover is only attempted between two simple unshifted keys (lowercase
+// letters / digits) so overlapping presses never tangle the Shift modifier.
+function is_rollable(char: string): boolean {
+  return /^[a-z0-9]$/.test(char);
 }

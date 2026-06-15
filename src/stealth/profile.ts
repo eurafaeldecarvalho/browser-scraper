@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import Database from "better-sqlite3";
@@ -228,11 +228,15 @@ export class ProfileManager {
   private _generate_default_cookies(): CookieSeed[] {
     const cookies: CookieSeed[] = [];
 
+    // Google cookies are intentionally limited to non-identity, non-reCAPTCHA
+    // values. A forged _GRECAPTCHA (random hex) buys ZERO reputation — Google
+    // mints and validates it server-side — and fabricating one only adds an
+    // inconsistency surface that can be cross-checked. Account cookies
+    // (SID/HSID/SSID) are likewise unforgeable and omitted. 1P_JAR is dropped
+    // because a hand-set date goes stale and reads as forged.
     cookies.push(
       { domain: ".google.com", name: "NID", value: this._random_hex(67), path: "/", secure: true, httpOnly: true },
-      { domain: ".google.com", name: "1P_JAR", value: `2024-12-${String(random_int(1, 20)).padStart(2, "0")}-${String(random_int(0, 23)).padStart(2, "0")}`, path: "/", secure: true, httpOnly: false },
       { domain: ".google.com", name: "AEC", value: this._random_base64(76), path: "/", secure: true, httpOnly: true },
-      { domain: ".google.com", name: "_GRECAPTCHA", value: `09${this._random_hex(126)}`, path: "/recaptcha", secure: true, httpOnly: true },
       { domain: ".google.com.br", name: "NID", value: this._random_hex(67), path: "/", secure: true, httpOnly: true },
     );
 
@@ -312,6 +316,41 @@ export class ProfileManager {
         _gads_sync: "accepted",
       },
     };
+  }
+}
+
+// Stable per-identity profile directories so a scraper "identity" keeps its
+// real cookies/history across runs — the returning-visitor reputation that
+// reCAPTCHA v3 rewards and a fresh temp profile can never accrue. Point baseDir
+// at a persistent volume (EFS) or sync to S3 between Lambda runs, and pin each
+// identity to ONE sticky residential/mobile egress IP: a warmed profile behind a
+// rotating datacenter IP earns nothing. See README "Identity & persistence".
+export class ProfileStore {
+  baseDir: string;
+
+  constructor({ baseDir }: { baseDir: string }) {
+    this.baseDir = baseDir;
+    mkdirSync(baseDir, { recursive: true });
+  }
+
+  // Returns (creating if needed) the userDataDir for a given identity id. Pass
+  // it as `userDataDir` to the Browser so the same profile is reused each run.
+  dirFor(identity: string): string {
+    const safe = identity.replace(/[^a-zA-Z0-9_.-]/g, "_") || "default";
+    const dir = join(this.baseDir, safe);
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  // Lists known identity directory names under baseDir.
+  list(): string[] {
+    try {
+      return readdirSync(this.baseDir, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
+    } catch {
+      return [];
+    }
   }
 }
 

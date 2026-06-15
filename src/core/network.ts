@@ -195,8 +195,10 @@ export class Network {
   private _response_handlers: Handler<[Response]>[] = [];
   private _loading_finished_handlers: Handler<[string]>[] = [];
   private _loading_failed_handlers: Handler<[string, string]>[] = [];
-  private _intercept_handlers: Array<[string, Handler<[Request]>]> = [];
+  private _intercept_handlers: Array<{ pattern: string; resourceType: string | null; handler: Handler<[Request]> }> = [];
   private _requests = new Map<string, Request>();
+  private _handle_auth_requests = false;
+  private _proxy_auth: [string, string] | null = null;
 
   constructor(cdp: CDPClient) {
     this._cdp = cdp;
@@ -215,17 +217,89 @@ export class Network {
     this._enabled = true;
   }
 
-  private async _enable_fetch(patterns: string[]): Promise<void> {
-    if (patterns.length === 0) {
+  /**
+   * Routes proxy credential challenges through the Fetch domain. Calling this is
+   * what lets interception coexist with an authenticated proxy: a single
+   * `Fetch.enable` carries both `handleAuthRequests` and the interception
+   * patterns, and a single `Fetch.requestPaused` listener (`_on_fetch_paused`)
+   * owns every paused request — so adding block rules later never clobbers the
+   * proxy auth or double-registers a competing pause handler.
+   */
+  async setProxyAuth(auth: [string, string]): Promise<void> {
+    this._proxy_auth = auth;
+    this._handle_auth_requests = true;
+
+    this._cdp.on("Fetch.authRequired", (params) => {
+      void (async () => {
+        const challenge = (params.authChallenge ?? {}) as Record<string, any>;
+        try {
+          if (challenge.source === "Proxy") {
+            await this._cdp.send("Fetch.continueWithAuth", {
+              requestId: params.requestId,
+              authChallengeResponse: {
+                response: "ProvideCredentials",
+                username: auth[0],
+                password: auth[1],
+              },
+            });
+            return;
+          }
+          await this._cdp.send("Fetch.continueWithAuth", {
+            requestId: params.requestId,
+            authChallengeResponse: { response: "CancelAuth" },
+          });
+        } catch {
+          // Challenge already resolved / connection gone — nothing to recover.
+        }
+      })();
+    });
+
+    await this._enable_fetch_now();
+  }
+
+  /**
+   * (Re)issues `Fetch.enable` reflecting the current interception rules and proxy
+   * auth state. With block rules present, only requests matching those rules
+   * (by URL glob and/or resourceType) pause — all other traffic, including the
+   * reCAPTCHA / anti-bot requests, flows untouched, so interception adds no
+   * observable surface to those requests. Resource-type filtering is applied at
+   * the CDP pattern level so the matching requests never even reach the renderer
+   * as a paused round-trip for unrelated traffic.
+   */
+  private async _enable_fetch_now(): Promise<void> {
+    const has_rules = this._intercept_handlers.length > 0;
+    if (!has_rules && !this._handle_auth_requests) {
       return;
     }
 
-    const cdp_patterns = patterns.map((pattern) => ({
-      urlPattern: pattern,
-      requestStage: "Request",
-    }));
+    const params: Record<string, unknown> = {};
 
-    await this._cdp.send("Fetch.enable", { patterns: cdp_patterns });
+    if (this._handle_auth_requests) {
+      // Proxy auth needs EVERY request to pause so its auth challenge surfaces as
+      // a Fetch.authRequired event. Restricting `patterns` would let a request
+      // that needs proxy credentials slip through unauthenticated
+      // (net::ERR_INVALID_AUTH_CREDENTIALS). So with proxy auth we pause all and
+      // let `_on_fetch_paused` abort only the blocked URLs/types and continue the
+      // rest. (CDP cannot filter the pause set by resourceType while still
+      // catching auth challenges on every request.)
+      params.handleAuthRequests = true;
+    } else {
+      // No proxy auth: pause ONLY the requests we intend to block — filtered by
+      // URL glob and/or resourceType at the CDP level — so all other traffic,
+      // including the reCAPTCHA / anti-bot requests, is never intercepted.
+      params.patterns = this._intercept_handlers.map((entry) => {
+        const pattern: Record<string, unknown> = {
+          urlPattern: entry.pattern,
+          requestStage: "Request",
+        };
+        if (entry.resourceType) {
+          pattern.resourceType = entry.resourceType;
+        }
+        return pattern;
+      });
+    }
+
+    await this._cdp.send("Fetch.enable", params);
 
     if (!this._fetch_enabled) {
       this._cdp.on("Fetch.requestPaused", (params) => this._on_fetch_paused(params));
@@ -258,11 +332,18 @@ export class Network {
     return register;
   }
 
-  intercept({ pattern = "*", handler }: { pattern?: string; handler?: Handler<[Request]> }): any {
+  intercept({
+    pattern = "*",
+    resourceType = null,
+    handler,
+  }: {
+    pattern?: string;
+    resourceType?: string | null;
+    handler?: Handler<[Request]>;
+  }): any {
     const register = <T extends Handler<[Request]>>(fn: T): T => {
-      this._intercept_handlers.push([pattern, fn]);
-      const all_patterns = [...new Set(this._intercept_handlers.map(([current]) => current))];
-      void this._enable_fetch(all_patterns);
+      this._intercept_handlers.push({ pattern, resourceType, handler: fn });
+      void this._enable_fetch_now();
       return fn;
     };
 
@@ -337,7 +418,10 @@ export class Network {
     );
 
     let handled = false;
-    for (const [pattern, handler] of this._intercept_handlers) {
+    for (const { pattern, resourceType, handler } of this._intercept_handlers) {
+      if (resourceType && request.resource_type !== resourceType) {
+        continue;
+      }
       if (match_glob(request.url, pattern)) {
         try {
           await handler(request);
@@ -354,11 +438,32 @@ export class Network {
     }
   }
 
-  async block({ patterns }: { patterns: string[] }): Promise<void> {
+  /**
+   * Aborts requests matching URL glob `patterns` and/or any of `resourceTypes`
+   * (e.g. "Image", "Media", "Font", "Stylesheet"). Aborting with
+   * `BlockedByClient` makes the dropped requests look like a content blocker
+   * (uBlock-style) rather than automation. resourceType blocks pause ONLY those
+   * types at the CDP level, leaving scripts/XHR/documents — and the reCAPTCHA /
+   * anti-bot traffic — completely untouched. EXCEPTION: when an authenticated
+   * proxy is in use, `Fetch.enable` must pause every request (no `patterns`) to
+   * surface the proxy auth challenge, so unrelated requests take a pass-through
+   * pause + `continueRequest` (never modified) rather than bypassing Fetch.
+   */
+  async block({
+    patterns = [],
+    resourceTypes = [],
+  }: {
+    patterns?: string[];
+    resourceTypes?: string[];
+  }): Promise<void> {
+    const abort = async (request: Request): Promise<void> => {
+      await request.abort({ reason: "BlockedByClient" });
+    };
     for (const pattern of patterns) {
-      this.intercept({ pattern, handler: async (request: Request) => {
-        await request.abort({ reason: "BlockedByClient" });
-      } });
+      this.intercept({ pattern, handler: abort });
+    }
+    for (const resourceType of resourceTypes) {
+      this.intercept({ pattern: "*", resourceType, handler: abort });
     }
   }
 }

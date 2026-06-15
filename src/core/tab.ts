@@ -3,6 +3,8 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { Keyboard } from "../behavior/keyboard";
 import { getSharedMouse, HumanMouse } from "../behavior/mouse";
+import { buildEvasionSource, screenLayout } from "../stealth/evasions";
+import { buildUserAgentMetadata, defaultWebglForPlatform, platformFromUA, type GeoProfile } from "../stealth/persona";
 import { CDPClient, CDPError } from "./cdp-client";
 import { Element } from "./element";
 import { Network } from "./network";
@@ -19,6 +21,22 @@ const WAIT_UNTIL_TO_PROTOCOL_EVENT: Record<WaitUntil, ProtocolLifecycleEvent> = 
   networkidle2: "networkAlmostIdle",
 };
 
+// Per-tab stealth configuration, derived as a coherent whole by the Browser from
+// one resolved User-Agent so the layers cannot contradict each other.
+export type TabStealth = {
+  userAgent?: string | null;
+  fullVersion?: string | null;
+  proxyAuth?: [string, string] | null;
+  webgl?: { vendor: string; renderer: string } | null;
+  // True when `webgl` was derived from the UA platform (spoofWebGL default), so
+  // a later setUserAgent that changes the OS must re-derive it.
+  webglAuto?: boolean;
+  geo?: Partial<GeoProfile> | null;
+  hardwareConcurrency?: number | null;
+  screen?: { width: number; height: number } | null;
+  evasions?: boolean;
+};
+
 export class Tab {
   ws_url: string;
   target_info: Record<string, any>;
@@ -31,22 +49,23 @@ export class Tab {
   private _network: Network | null = null;
   private _proxy_auth: [string, string] | null;
   private _user_agent: string | null;
-  private _webgl: { vendor: string | null; renderer: string | null };
+  private _full_version: string | null;
+  private _webgl: { vendor: string; renderer: string } | null;
+  private _webgl_auto: boolean;
+  private _webgl_script_id: string | null = null;
+  private _stealth: TabStealth;
 
-  constructor(
-    ws_url: string,
-    target_info: Record<string, any>,
-    proxy_auth: [string, string] | null = null,
-    user_agent: string | null = null,
-    webgl: { vendor: string | null; renderer: string | null } = { vendor: null, renderer: null },
-  ) {
+  constructor(ws_url: string, target_info: Record<string, any>, stealth: TabStealth = {}) {
     this.ws_url = ws_url;
     this.target_info = target_info;
     this.target_id = String(target_info.id ?? "");
     this._cdp = new CDPClient(ws_url);
-    this._proxy_auth = proxy_auth;
-    this._user_agent = user_agent;
-    this._webgl = webgl;
+    this._stealth = stealth;
+    this._proxy_auth = stealth.proxyAuth ?? null;
+    this._user_agent = stealth.userAgent ?? null;
+    this._full_version = stealth.fullVersion ?? null;
+    this._webgl = stealth.webgl ?? null;
+    this._webgl_auto = stealth.webglAuto ?? false;
   }
 
   async connect(): Promise<void> {
@@ -80,49 +99,20 @@ export class Tab {
     });
 
     await this._apply_user_agent_override();
+    await this._apply_geo();
+    await this._apply_hardware_override();
     await this._apply_webgl_override();
+    await this._apply_evasions();
+    await this._apply_screen_metrics();
 
     if (this._proxy_auth) {
-      await this._cdp.send("Fetch.enable", {
-        handleAuthRequests: true,
-      });
-
-      const proxy_auth = this._proxy_auth;
-      const cdp = this._cdp;
-
-      this._cdp.on("Fetch.authRequired", (params) => {
-        void (async () => {
-          const auth_challenge = params.authChallenge as Record<string, any> | undefined;
-          try {
-            if (auth_challenge?.source === "Proxy") {
-              const [username, password] = proxy_auth;
-              await cdp.send("Fetch.continueWithAuth", {
-                requestId: params.requestId,
-                authChallengeResponse: {
-                  response: "ProvideCredentials",
-                  username,
-                  password,
-                },
-              });
-              return;
-            }
-
-            await cdp.send("Fetch.continueWithAuth", {
-              requestId: params.requestId,
-              authChallengeResponse: {
-                response: "CancelAuth",
-              },
-            });
-          } catch {
-          }
-        })();
-      });
-
-      this._cdp.on("Fetch.requestPaused", (params) => {
-        void cdp.send("Fetch.continueRequest", {
-          requestId: params.requestId,
-        }).catch(() => undefined);
-      });
+      // Route proxy credential handling through the Network's Fetch ownership so
+      // it coexists with request interception: one Fetch.enable carries both the
+      // auth handling and any block patterns, and one requestPaused handler owns
+      // every paused request. (Previously this enabled Fetch inline, which a
+      // later network.intercept() would override — dropping handleAuthRequests
+      // and racing a second requestPaused handler.)
+      await this.network.setProxyAuth(this._proxy_auth);
     }
 
     try {
@@ -177,8 +167,25 @@ export class Tab {
 
   // Applies a cleaned User-Agent together with matching client-hint metadata.
   // Overriding the UA string alone leaves sec-ch-ua headers reporting
-  // "HeadlessChrome"; supplying userAgentMetadata keeps both in sync.
+  // "HeadlessChrome"; supplying userAgentMetadata keeps both in sync. Runs
+  // UNCONDITIONALLY: if no UA was threaded in (e.g. /json/version failed at
+  // launch), it recovers the real UA via Browser.getVersion so the CH override
+  // is never silently skipped (which would leave HeadlessChrome on the wire).
   private async _apply_user_agent_override(): Promise<void> {
+    if (!this._user_agent) {
+      try {
+        const version = await this._cdp.send("Browser.getVersion");
+        if (typeof version.userAgent === "string") {
+          this._user_agent = strip_headless(version.userAgent);
+        }
+        if (!this._full_version && typeof version.product === "string") {
+          this._full_version = version.product.match(/\d+\.[\d.]+/)?.[0] ?? null;
+        }
+      } catch {
+        // Fall through: nothing to override if we can't learn the UA.
+      }
+    }
+
     if (!this._user_agent) {
       return;
     }
@@ -186,7 +193,7 @@ export class Tab {
     try {
       await this._cdp.send("Network.setUserAgentOverride", {
         userAgent: this._user_agent,
-        userAgentMetadata: build_user_agent_metadata(this._user_agent),
+        userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version),
       });
     } catch (error) {
       if (!(error instanceof CDPError)) {
@@ -195,19 +202,129 @@ export class Tab {
     }
   }
 
-  // Spoofs the WebGL UNMASKED vendor/renderer reported to the page. Critical on
-  // GPU-less cloud hosts, where Chrome falls back to SwiftShader/llvmpipe — a
-  // strong headless/server tell. The Proxy preserves getParameter.toString() so
-  // the override doesn't itself read as a patched ("lying") function.
+  // Spoofs the WebGL UNMASKED vendor/renderer reported to the page. The Proxy
+  // preserves getParameter.toString() so the override doesn't itself read as a
+  // patched ("lying") function. NOTE: this is string-only — on a GPU-less host
+  // the extension list and rendered pixel hash still come from SwiftShader, so a
+  // discrete-GPU identity is only safe for soft targets (see README "GPU").
   private async _apply_webgl_override(): Promise<void> {
-    const { vendor, renderer } = this._webgl;
-    if (!vendor || !renderer) {
+    if (!this._webgl) {
       return;
     }
 
+    const { vendor, renderer } = this._webgl;
     const source = build_webgl_override_source(vendor, renderer);
     try {
+      this._webgl_script_id = await this.addInitScript({ source });
+    } catch (error) {
+      if (!(error instanceof CDPError)) {
+        throw error;
+      }
+    }
+  }
+
+  // Aligns timezone + locale + Accept-Language with the (proxy) exit region so
+  // IP-geo, Intl timezone and navigator.languages agree — a cross-layer mismatch
+  // here (e.g. UTC clock on a foreign IP) is a documented hard tell. Re-issues
+  // the UA override with acceptLanguage so Chrome regenerates navigator.languages
+  // coherently rather than leaving a header-vs-JS divergence.
+  private async _apply_geo(): Promise<void> {
+    const geo = this._stealth.geo;
+    if (!geo) {
+      return;
+    }
+
+    try {
+      if (geo.timezone) {
+        await this._cdp.send("Emulation.setTimezoneOverride", { timezoneId: geo.timezone });
+      }
+      if (geo.locale) {
+        await this._cdp.send("Emulation.setLocaleOverride", { locale: geo.locale });
+      }
+      if (geo.acceptLanguage && this._user_agent) {
+        await this._cdp.send("Network.setUserAgentOverride", {
+          userAgent: this._user_agent,
+          acceptLanguage: geo.acceptLanguage,
+          userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version),
+        });
+      } else if (geo.acceptLanguage) {
+        await this._cdp.send("Network.setExtraHTTPHeaders", { headers: { "Accept-Language": geo.acceptLanguage } });
+      }
+    } catch (error) {
+      if (!(error instanceof CDPError)) {
+        throw error;
+      }
+    }
+  }
+
+  // Pins navigator.hardwareConcurrency at the ENGINE level so the value
+  // propagates to web workers too (a main-vs-worker mismatch is a stronger tell
+  // than the value itself). deviceMemory has no such CDP override and is
+  // deliberately NOT spoofed — a main-world-only patch would desync from workers.
+  private async _apply_hardware_override(): Promise<void> {
+    const cores = this._stealth.hardwareConcurrency;
+    if (typeof cores !== "number" || cores <= 0) {
+      return;
+    }
+
+    try {
+      await this._cdp.send("Emulation.setHardwareConcurrencyOverride", { hardwareConcurrency: cores });
+    } catch (error) {
+      if (!(error instanceof CDPError)) {
+        throw error;
+      }
+    }
+  }
+
+  // Injects the defense-in-depth JS patches (webdriver getter, Notification ↔
+  // permissions reconcile, screen geometry) before any page script runs. Each
+  // patch is conditional/defensive — see stealth/evasions.ts.
+  private async _apply_evasions(): Promise<void> {
+    if (this._stealth.evasions === false) {
+      return;
+    }
+
+    const source = buildEvasionSource({
+      webdriver: true,
+      notifications: true,
+      screen: this._stealth.screen ?? null,
+    });
+
+    if (!source.trim()) {
+      return;
+    }
+
+    try {
       await this.addInitScript({ source });
+    } catch (error) {
+      if (!(error instanceof CDPError)) {
+        throw error;
+      }
+    }
+  }
+
+  // Sets a realistic viewport/screen via device metrics so headless doesn't
+  // report a 0-sized or mismatched screen. Only applied when an explicit screen
+  // is configured (the evasion init script aligns window.screen.* / outerWidth).
+  private async _apply_screen_metrics(): Promise<void> {
+    const screen = this._stealth.screen;
+    if (!screen) {
+      return;
+    }
+
+    const layout = screenLayout(screen.width, screen.height);
+    try {
+      await this._cdp.send("Emulation.setDeviceMetricsOverride", {
+        // Inner viewport = screen minus OS taskbar and browser chrome, so
+        // innerHeight < outerHeight (set by the screen evasion) < screen height,
+        // matching a real maximized window instead of inner == outer.
+        width: layout.viewportWidth,
+        height: layout.viewportHeight,
+        deviceScaleFactor: 1,
+        mobile: false,
+        screenWidth: layout.screenWidth,
+        screenHeight: layout.screenHeight,
+      });
     } catch (error) {
       if (!(error instanceof CDPError)) {
         throw error;
@@ -218,7 +335,15 @@ export class Tab {
   // Sets the WebGL identity for subsequent navigations in this tab.
   async spoofWebGL({ vendor, renderer }: { vendor: string; renderer: string }): Promise<void> {
     this._webgl = { vendor, renderer };
-    await this.addInitScript({ source: build_webgl_override_source(vendor, renderer) });
+    this._webgl_auto = false; // explicit identity — do not auto-track UA changes
+    if (this._webgl_script_id) {
+      try {
+        await this.removeInitScript({ identifier: this._webgl_script_id });
+      } catch {
+        // Best effort: a stale identifier just means the old script stays.
+      }
+    }
+    this._webgl_script_id = await this.addInitScript({ source: build_webgl_override_source(vendor, renderer) });
   }
 
   private async _refresh_main_frame_id(): Promise<string> {
@@ -1445,11 +1570,34 @@ export class Tab {
   // Overrides the User-Agent and keeps the client-hint metadata consistent so
   // navigator.userAgentData and sec-ch-ua-* agree with the new string.
   async setUserAgent({ userAgent }: { userAgent: string }): Promise<void> {
+    const previous_platform = this._user_agent ? platformFromUA(this._user_agent) : null;
     this._user_agent = userAgent;
     await this._cdp.send("Network.setUserAgentOverride", {
       userAgent,
-      userAgentMetadata: build_user_agent_metadata(userAgent),
+      userAgentMetadata: buildUserAgentMetadata(userAgent, this._full_version),
     });
+
+    // If the WebGL identity was OS-derived (spoofWebGL) and this UA changes the
+    // OS, re-pin it — otherwise the page sees the old-OS GPU under the new-OS UA,
+    // an impossible pair DataDome Picasso hard-blocks. Affects the NEXT
+    // navigation (init scripts run per document), which is the normal call order.
+    const next_platform = platformFromUA(userAgent);
+    if (this._webgl_auto && previous_platform !== next_platform) {
+      const next = defaultWebglForPlatform(next_platform);
+      this._webgl = next;
+      try {
+        if (this._webgl_script_id) {
+          await this.removeInitScript({ identifier: this._webgl_script_id });
+        }
+        this._webgl_script_id = await this.addInitScript({
+          source: build_webgl_override_source(next.vendor, next.renderer),
+        });
+      } catch (error) {
+        if (!(error instanceof CDPError)) {
+          throw error;
+        }
+      }
+    }
   }
 
   async setGeolocation({
@@ -1500,7 +1648,7 @@ export class Tab {
       await this._cdp.send("Network.setUserAgentOverride", {
         userAgent: this._user_agent,
         acceptLanguage: accept_language,
-        userAgentMetadata: build_user_agent_metadata(this._user_agent),
+        userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version),
       });
     } else if (accept_language) {
       await this._cdp.send("Network.setExtraHTTPHeaders", { headers: { "Accept-Language": accept_language } });
@@ -1557,6 +1705,26 @@ export class Tab {
     }
 
     return this._network;
+  }
+
+  /**
+   * Drops bandwidth-heavy resources that never carry scraped data — by default
+   * images and media — plus optional URL globs (analytics/trackers). Useful to
+   * cut metered-proxy traffic. Aborted requests look like a content blocker
+   * (BlockedByClient), and only the listed resource types pause at the CDP
+   * level, so scripts, XHR/fetch, documents and any reCAPTCHA / anti-bot
+   * requests are never intercepted — EXCEPT behind an authenticated proxy, where
+   * CDP must pause every request to answer the auth challenge, so non-blocked
+   * requests take a pass-through pause + continue (never modified, just briefly
+   * paused). Add "Font"/"Stylesheet" with care: removing
+   * stylesheets can break visibility-based waits, and fonts feed some anti-bot
+   * fingerprints.
+   */
+  async blockResources({
+    types = ["Image", "Media"],
+    urls = [],
+  }: { types?: string[]; urls?: string[] } = {}): Promise<void> {
+    await this.network.block({ resourceTypes: types, patterns: urls });
   }
 
   // Shared human-like cursor for this tab; position persists across moves/clicks.
@@ -1649,39 +1817,8 @@ function build_webgl_override_source(vendor: string, renderer: string): string {
   `;
 }
 
-// Builds Client Hints metadata consistent with the given UA string so that
-// navigator.userAgentData and the sec-ch-ua-* request headers agree with it.
-function build_user_agent_metadata(user_agent: string): Record<string, unknown> {
-  const major = user_agent.match(/Chrome\/(\d+)/)?.[1] ?? "120";
-
-  let platform = "Windows";
-  let platform_version = "10.0.0";
-  if (user_agent.includes("Macintosh")) {
-    platform = "macOS";
-    platform_version = "13.0.0";
-  } else if (user_agent.includes("Linux") && !user_agent.includes("Android")) {
-    platform = "Linux";
-    platform_version = "6.0.0";
-  } else if (user_agent.includes("Android")) {
-    platform = "Android";
-    platform_version = "13.0.0";
-  }
-
-  const brands = [
-    { brand: "Chromium", version: major },
-    { brand: "Google Chrome", version: major },
-    { brand: "Not?A_Brand", version: "24" },
-  ];
-
-  return {
-    brands,
-    fullVersionList: brands.map((entry) => ({ brand: entry.brand, version: `${entry.version}.0.0.0` })),
-    platform,
-    platformVersion: platform_version,
-    architecture: "x86",
-    bitness: "64",
-    model: "",
-    mobile: user_agent.includes("Android") || user_agent.includes("Mobile"),
-    wow64: false,
-  };
+// Removes the "Headless" marker the --headless=new build injects into the UA, so
+// a UA recovered via Browser.getVersion is indistinguishable from a headful one.
+function strip_headless(user_agent: string): string {
+  return user_agent.replace(/HeadlessChrome/g, "Chrome");
 }

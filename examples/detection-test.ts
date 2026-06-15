@@ -85,7 +85,84 @@ async function main(): Promise<void> {
     const gpu = await tab.evaluate({ expression: "document.documentElement.getAttribute('data-gpu')" });
     console.log("WebGL renderer (main world):", gpu);
     if (typeof gpu === "string" && /swiftshader|llvmpipe|software/i.test(gpu)) {
-      console.log("  ^ software rendering detected — set spoofWebGL on cloud hosts");
+      console.log("  ^ software rendering detected — set spoofWebGL (or run a real GPU) on cloud hosts");
+    }
+
+    // --- Evasion integrity: do our patches read as native + stay consistent? ---
+    // Runs in the MAIN world (where detectors read) via an injected <script>, so
+    // it sees the addScriptToEvaluateOnNewDocument patches, not the isolated world.
+    console.log("\n=== evasion integrity (main world) ===");
+    const probe = `(function(){
+      try {
+        var out = {};
+        var nat = function(fn){ try { return Function.prototype.toString.call(fn).indexOf('[native code]') !== -1; } catch(e){ return false; } };
+        var d = Object.getOwnPropertyDescriptor(Navigator.prototype, 'webdriver');
+        out.webdriver_value = navigator.webdriver;
+        out.webdriver_present = ('webdriver' in navigator);
+        out.webdriver_is_getter = !!(d && typeof d.get === 'function');
+        try { document.createElement('canvas').getContext('webgl'); out.getParameter_native = nat(WebGLRenderingContext.prototype.getParameter); } catch(e){ out.getParameter_native = null; }
+        out.permissions_query_native = nat(navigator.permissions && navigator.permissions.query);
+        out.notification_permission = (window.Notification && Notification.permission) || null;
+        out.hardwareConcurrency = navigator.hardwareConcurrency;
+        out.deviceMemory = navigator.deviceMemory;
+        out.outerWidth = window.outerWidth;
+        out.outerHeight = window.outerHeight;
+        out.screen = window.screen.width + 'x' + window.screen.height;
+        out.uadata_platform = (navigator.userAgentData && navigator.userAgentData.platform) || null;
+        out.ua = navigator.userAgent;
+        document.documentElement.setAttribute('data-integrity', JSON.stringify(out));
+        if (navigator.permissions && navigator.permissions.query) {
+          navigator.permissions.query({name:'notifications'}).then(function(p){ document.documentElement.setAttribute('data-perm-state', p.state); }).catch(function(){});
+        }
+        try {
+          var code = 'self.postMessage({hc: navigator.hardwareConcurrency, dm: navigator.deviceMemory})';
+          var w = new Worker(URL.createObjectURL(new Blob([code], {type:'text/javascript'})));
+          w.onmessage = function(ev){ document.documentElement.setAttribute('data-worker', JSON.stringify(ev.data)); w.terminate(); };
+        } catch(e){ document.documentElement.setAttribute('data-worker', 'err'); }
+      } catch(e){ document.documentElement.setAttribute('data-integrity', 'err:'+(e && e.message)); }
+    })();`;
+
+    await tab.evaluate({
+      expression: `(() => { const s = document.createElement('script'); s.textContent = ${JSON.stringify(probe)}; document.documentElement.appendChild(s); s.remove(); })()`,
+    });
+    // Poll for the async worker reading instead of a fixed sleep — a missing
+    // reading must read as a FAIL, never a silent PASS.
+    try {
+      await tab.waitForFunction({
+        expression: "document.documentElement.getAttribute('data-worker') !== null",
+        timeout: 3_000,
+      });
+    } catch {
+      // Worker never reported — handled as a FAIL below.
+    }
+
+    const integrityRaw = await tab.evaluate({ expression: "document.documentElement.getAttribute('data-integrity')" });
+    const permState = await tab.evaluate({ expression: "document.documentElement.getAttribute('data-perm-state')" });
+    const workerRaw = await tab.evaluate({ expression: "document.documentElement.getAttribute('data-worker')" });
+
+    try {
+      const it = JSON.parse(typeof integrityRaw === "string" ? integrityRaw : "{}");
+      const worker = JSON.parse(typeof workerRaw === "string" && workerRaw.startsWith("{") ? workerRaw : "{}");
+      const line = (ok: boolean, label: string, value: unknown) => console.log(`${ok ? "ok   " : "FAIL "}${label}: ${String(value)}`);
+
+      line(it.webdriver_present === true && it.webdriver_value === false, "navigator.webdriver present && false", `${it.webdriver_value} (getter=${it.webdriver_is_getter})`);
+      line(it.getParameter_native !== false, "WebGL getParameter toString native", it.getParameter_native);
+      line(it.permissions_query_native !== false, "permissions.query toString native", it.permissions_query_native);
+      // Valid coherence: query state must be a real PermissionState, and
+      // Notification.permission 'default' maps to query 'prompt'.
+      const validState = ["granted", "denied", "prompt"].includes(String(permState));
+      const mapped = (it.notification_permission === "default" && permState === "prompt") || it.notification_permission === permState;
+      line(validState && mapped, "Notification.permission <-> permissions.query coherent", `${it.notification_permission} <-> ${permState}`);
+      line(it.outerWidth > 0 && it.outerHeight > 0, "window.outerWidth/Height non-zero", `${it.outerWidth}x${it.outerHeight}`);
+      const uaPlat = /Linux/.test(it.ua) ? "Linux" : /Windows/.test(it.ua) ? "Windows" : /Mac/.test(it.ua) ? "macOS" : "?";
+      line(!it.uadata_platform || it.uadata_platform === uaPlat, "userAgentData.platform matches UA OS", `${it.uadata_platform} vs ${uaPlat}`);
+      // Worker readings MUST be present (missing => the probe didn't run => FAIL).
+      const hcPresent = typeof worker.hc === "number";
+      line(hcPresent && worker.hc === it.hardwareConcurrency, "hardwareConcurrency main==worker", `${it.hardwareConcurrency} / ${hcPresent ? worker.hc : "MISSING"}`);
+      const dmPresent = typeof worker.dm === "number";
+      line(dmPresent && worker.dm === it.deviceMemory, "deviceMemory main==worker", `${it.deviceMemory} / ${dmPresent ? worker.dm : "MISSING"}`);
+    } catch (error) {
+      console.log("integrity parse error:", error, integrityRaw);
     }
   } finally {
     await browser.close();
