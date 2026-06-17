@@ -599,6 +599,6 @@ Starring the repo helps too — it's how other developers find the project.
 
 [iproyal]: https://iproyal.com/?r=eurafaeldecarvalho
 [brightdata]: https://brightdata.com
-[hostinger]: https://www.hostinger.com/br?REFERRALCODE=9PIRAFAELLV8
+[hostinger]: https://www.hostinger.com/vps-hosting?REFERRALCODE=9PIRAFAELLV8
 [2captcha]: https://2captcha.com/auth/register/?from=12417190
 [anticaptcha]: https://getcaptchasolution.com/yykljfdcin
