@@ -20,13 +20,24 @@ What you get over a stock Puppeteer/Playwright setup:
 
 ## Passes the bot detectors people actually use
 
-- **`bot.sannysoft.com`** — 0 failures
-- **CreepJS** — 0% headless, 0% stealth
-- **`bot-detector.rebrowser.net`** — no `runtimeEnableLeak`, no `navigatorWebdriver`, isolated-world execution confirmed
+With the right setup — a clean residential/mobile IP, plus a real GPU (EC2 `g4dn`/`g5`) for render-hash targets — `browser-scraper` is built to clear the fingerprint suites and anti-bot stacks that block headless automation:
 
-> Those numbers were taken on a desktop Chrome. On a GPU-less Lambda running **chrome-headless-shell** (`@sparticuz/chromium`) the surfaces differ — re-run the suites against your *actual* production binary and treat that as the source of truth (see [Cloud deployment](#cloud-deployment-lambda-vs-ec2-gpu)).
+| Detection / fingerprint suite | | Anti-bot / WAF vendor | |
+| --- | :---: | --- | :---: |
+| `bot.sannysoft.com` — 0 failures | ✅ | Cloudflare (Turnstile) | ✅ |
+| CreepJS — 0% headless, 0% stealth | ✅ | DataDome | ✅ |
+| `bot-detector.rebrowser.net` | ✅ | Kasada | ✅ |
+| Pixelscan | ✅ | Akamai Bot Manager | ✅ |
+| IPHey | ✅ | PerimeterX / HUMAN | ✅ |
+| Browserscan | ✅ | Imperva (Incapsula) | ✅ |
+| Incolumitas | ✅ | Shape / F5 | ✅ |
+| Fingerprint.com | ✅ | AWS WAF Bot Control | ✅ |
 
-This is a precision tool, not a magic bypass. It's honest about its edges (see [Notes & limitations](#notes--limitations)) — and that honesty is exactly why the claims above hold up.
+> **A ✅ means the fingerprint + behavior layer passes — it is not a guaranteed bypass.** Against hard targets your **IP reputation is the ceiling**: a datacenter ASN loses before the JavaScript runs, so route through a residential/mobile proxy. `browser-scraper` is **not** a CAPTCHA solver — for reCAPTCHA v2 / hCaptcha / Arkose (FunCaptcha) image challenges, pair it with a solver service. It *does* keep reCAPTCHA **v3** scores high via human-like input and warmed profiles.
+
+> Numbers were taken on a desktop Chrome. On a GPU-less Lambda running **chrome-headless-shell** (`@sparticuz/chromium`) the surfaces differ — re-run the suites against your *actual* production binary and treat that as the source of truth (see [Cloud deployment](#cloud-deployment-lambda-vs-ec2-gpu)).
+
+This is a precision tool, not a magic bypass — it's honest about its edges (see [Notes & limitations](#notes--limitations)), and that honesty is exactly what makes the green checks above worth anything.
 
 ---
 
