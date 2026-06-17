@@ -252,10 +252,15 @@ export class Element {
     text,
     humanLike = true,
     clear = false,
+    typos = false,
   }: {
     text: string;
     humanLike?: boolean;
     clear?: boolean;
+    // Inject occasional adjacent-key typos + self-correction (human-weighted by
+    // behavioral scorers). OFF by default — opt in only where mid-type value
+    // assertions won't break. See Keyboard.type.
+    typos?: boolean;
   }): Promise<void> {
     await this.focus();
 
@@ -294,7 +299,7 @@ export class Element {
     await delay(40);
 
     const keyboard = new Keyboard(this._cdp, this._session_id);
-    await keyboard.type(text, { humanLike });
+    await keyboard.type(text, { humanLike, typos });
   }
 
   // Presses a single key (e.g. "Enter", "Tab", "ArrowDown") on this element

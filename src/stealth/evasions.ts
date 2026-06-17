@@ -18,6 +18,14 @@ export type EvasionOptions = {
   webdriver?: boolean;
   notifications?: boolean;
   screen?: { width: number; height: number } | null;
+  // chrome-headless-shell only: shim window.chrome and a non-zero
+  // navigator.connection.rtt, both present on real headful Chrome but missing in
+  // the shell binary. Conditional (no-op when already present/non-zero).
+  windowChrome?: boolean;
+  connection?: boolean;
+  // OPT-IN: override MouseEvent.screenX/screenY to clientX+x / clientY+y to
+  // counter the CDP screenX==clientX artifact. Verify on your binary first.
+  screenCoordOffset?: { x: number; y: number } | null;
 };
 
 // Chrome's window chrome (tabs + omnibox + bookmarks bar) and a typical OS
@@ -147,6 +155,128 @@ function screenSource(width: number, height: number): string {
   `;
 }
 
+// Shell-only / opt-in shims for surfaces chrome-headless-shell lacks but a real
+// headful Chrome exposes natively (window.chrome; a non-zero
+// navigator.connection.rtt) plus the opt-in CDP screenX/screenY fix. All run in
+// ONE IIFE sharing a native-toString helper, so every fabricated callable/getter
+// reports "function … { [native code] }" and can't be unmasked by a direct
+// Function.prototype.toString check (the same discipline the WebGL override uses).
+// Descriptors are written to MATCH real Chrome: window.chrome is an enumerable,
+// writable, CONFIGURABLE own data property (a non-configurable descriptor is
+// itself a spoof signature — native window/navigator props are configurable);
+// connection/MouseEvent values are accessors on the PROTOTYPE, where real Chrome's
+// WebIDL getters live (an own accessor on the instance is an own-vs-prototype
+// tell). KNOWN LIMITATION: a detector that pulls a pristine
+// Function.prototype.toString from a fresh iframe can still unmask a fabricated fn
+// — inherent to any JS-level shim; these are soft-target aids only (see
+// docs/antibot-and-captcha-research.md). Each block is conditional and no-ops when
+// the value is already real, so a full/headful Chrome is never touched.
+function coherentShimsSource(opts: {
+  windowChrome?: boolean;
+  connection?: boolean;
+  screenCoordOffset?: { x: number; y: number } | null;
+}): string {
+  const blocks: string[] = [];
+
+  if (opts.windowChrome) {
+    blocks.push(`
+        // window.chrome — only when genuinely absent (never overwrite a real one).
+        if (!(window.chrome && window.chrome.runtime)) {
+          const chrome = window.chrome || {};
+          if (!chrome.runtime) {
+            chrome.runtime = {
+              connect: nf('connect', function () {}),
+              sendMessage: nf('sendMessage', function () {}),
+              OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' },
+              OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' },
+              PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' },
+              PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' },
+              RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' },
+            };
+          }
+          if (!chrome.app) {
+            chrome.app = {
+              isInstalled: false,
+              InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+              RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+              getDetails: nf('getDetails', function () { return null; }),
+              getIsInstalled: nf('getIsInstalled', function () { return false; }),
+            };
+          }
+          if (!chrome.csi) chrome.csi = nf('csi', function () { return { onloadT: Date.now(), startE: Date.now(), pageT: 0, tran: 15 }; });
+          if (!chrome.loadTimes) chrome.loadTimes = nf('loadTimes', function () { return {}; });
+          Object.defineProperty(window, 'chrome', { value: chrome, writable: true, enumerable: true, configurable: true });
+        }`);
+  }
+
+  if (opts.connection) {
+    blocks.push(`
+        // navigator.connection: shell reports rtt===0. Patch on the PROTOTYPE with
+        // native-looking getters, only when rtt is the headless 0 default. rtt is a
+        // 25ms multiple like real Chrome; effectiveType/downlink only if missing.
+        {
+          const c = navigator.connection;
+          if (c && c.rtt === 0) {
+            const proto = Object.getPrototypeOf(c) || c;
+            ng(proto, 'rtt', [50, 75, 100][Math.floor(Math.random() * 3)]);
+            if (!c.effectiveType) ng(proto, 'effectiveType', '4g');
+            if (!c.downlink) ng(proto, 'downlink', 10);
+          }
+        }`);
+  }
+
+  if (opts.screenCoordOffset) {
+    blocks.push(`
+        // MouseEvent.screenX/screenY = clientX+sx / clientY+sy (opt-in).
+        {
+          const sx = ${JSON.stringify(opts.screenCoordOffset.x)};
+          const sy = ${JSON.stringify(opts.screenCoordOffset.y)};
+          ng(MouseEvent.prototype, 'screenX', null, function () { return (this.clientX || 0) + sx; });
+          ng(MouseEvent.prototype, 'screenY', null, function () { return (this.clientY || 0) + sy; });
+        }`);
+  }
+
+  if (!blocks.length) {
+    return "";
+  }
+
+  return `
+    (() => {
+      try {
+        const reg = new WeakSet();
+        const origToString = Function.prototype.toString;
+        const proxyToString = new Proxy(origToString, {
+          apply(target, thisArg, args) {
+            if (reg.has(thisArg)) {
+              return 'function ' + ((thisArg && thisArg.name) || '') + '() { [native code] }';
+            }
+            return Reflect.apply(target, thisArg, args);
+          },
+        });
+        reg.add(proxyToString);
+        try { Function.prototype.toString = proxyToString; } catch (_) {}
+        // nf: mark a fabricated FUNCTION native (also sets its .name).
+        const nf = (name, fn) => {
+          try { Object.defineProperty(fn, 'name', { value: name, configurable: true }); } catch (_) {}
+          reg.add(fn);
+          return fn;
+        };
+        // ng: define a native-looking GETTER on a prototype (fixed val, or an
+        // explicit getter fn). Getter name is "get <prop>" to match native.
+        const ng = (proto, prop, val, getter) => {
+          try {
+            const g = getter || function () { return val; };
+            try { Object.defineProperty(g, 'name', { value: 'get ' + prop, configurable: true }); } catch (_) {}
+            reg.add(g);
+            Object.defineProperty(proto, prop, { get: g, enumerable: true, configurable: true });
+          } catch (_) {}
+        };
+        ${blocks.join("\n")}
+      } catch (_) {}
+    })();
+  `;
+}
+
 // Concatenates the requested evasion init scripts into a single source blob,
 // injected before any page script runs.
 export function buildEvasionSource(options: EvasionOptions): string {
@@ -160,6 +290,15 @@ export function buildEvasionSource(options: EvasionOptions): string {
   }
   if (options.screen) {
     parts.push(screenSource(options.screen.width, options.screen.height));
+  }
+  // Shell-only / opt-in shims, in one IIFE sharing the native-toString helper.
+  const shimSource = coherentShimsSource({
+    windowChrome: options.windowChrome,
+    connection: options.connection,
+    screenCoordOffset: options.screenCoordOffset ?? null,
+  });
+  if (shimSource.trim()) {
+    parts.push(shimSource);
   }
 
   return parts.join("\n");

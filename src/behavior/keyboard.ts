@@ -192,7 +192,10 @@ export class Keyboard {
   // longer pauses, and intermittent key ROLLOVER — pressing the next key before
   // releasing the current one, which is physically real for fast typists and
   // structurally impossible with a strictly sequential down→up loop.
-  async type(text: string, { humanLike = true }: { humanLike?: boolean } = {}): Promise<void> {
+  async type(
+    text: string,
+    { humanLike = true, typos = false }: { humanLike?: boolean; typos?: boolean } = {},
+  ): Promise<void> {
     await this._warm_input_pipeline();
 
     const chars = [...text];
@@ -203,6 +206,20 @@ export class Keyboard {
       if (!humanLike) {
         await this._press(char);
         continue;
+      }
+
+      // Occasional realistic typo on a letter: hit an adjacent QWERTY key, pause
+      // as if noticing, Backspace, then type the right one. Behavioral scorers
+      // (reCAPTCHA v3) weight self-correction as strongly human. OFF by default —
+      // a scraper that asserts exact field values mid-type must opt in.
+      if (typos && Math.random() < 0.03) {
+        const wrong = adjacent_key(char);
+        if (wrong) {
+          await this._press(wrong);
+          await delay(lognormal_ms(170, 0.5, 80, 420));
+          await this._press("Backspace");
+          await delay(lognormal_ms(90, 0.4, 40, 200));
+        }
       }
 
       const dwell = lognormal_ms(70, 0.5, 25, 180);
@@ -250,4 +267,50 @@ function lognormal_ms(median: number, sigma: number, min: number, max: number): 
 // letters / digits) so overlapping presses never tangle the Shift modifier.
 function is_rollable(char: string): boolean {
   return /^[a-z0-9]$/.test(char);
+}
+
+// Approximate QWERTY physical neighbours, for realistic typos. Only letters are
+// covered; anything else returns null (no typo injected). Case is preserved.
+const QWERTY_NEIGHBORS: Record<string, string> = {
+  q: "wa",
+  w: "qes",
+  e: "wrd",
+  r: "etf",
+  t: "ryg",
+  y: "tuh",
+  u: "yij",
+  i: "uok",
+  o: "ipl",
+  p: "ol",
+  a: "qsz",
+  s: "awdz",
+  d: "sefcx",
+  f: "drgvc",
+  g: "ftyhbv",
+  h: "gyujnb",
+  j: "huiknm",
+  k: "jiolm",
+  l: "kop",
+  z: "asx",
+  x: "zsdc",
+  c: "xdfv",
+  v: "cfgb",
+  b: "vghn",
+  n: "bhjm",
+  m: "njk",
+};
+
+// Picks a plausible adjacent-key misstroke for a letter (preserving case), or
+// null for non-letters / unmapped chars (so no typo is injected there).
+function adjacent_key(char: string): string | null {
+  const lower = char.toLowerCase();
+  if (!/^[a-z]$/.test(lower)) {
+    return null;
+  }
+  const neighbors = QWERTY_NEIGHBORS[lower];
+  if (!neighbors) {
+    return null;
+  }
+  const pick = neighbors[Math.floor(Math.random() * neighbors.length)];
+  return char === char.toUpperCase() ? pick.toUpperCase() : pick;
 }
