@@ -2,5 +2,7 @@ node_modules/
 dist/
 *.png
 
-# scratch: firecrawl raw search dumps (curated .md notes are kept)
-.firecrawl/*.json
+# internal tooling / research (not part of the published library)
+.firecrawl/
+.agents/
+.claude/

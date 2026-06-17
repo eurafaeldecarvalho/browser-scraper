@@ -1,7 +1,7 @@
 {
-    "name": "@rafaelgdn/browser-scraper",
+    "name": "@eurafaeldecarvalho/browser-scraper",
     "version": "0.6.0",
-    "description": "CDP-first browser automation library with closed Shadow DOM access, profile seeding, and antibot-oriented features",
+    "description": "Stealth browser automation & web scraping for Node.js. CDP-first, undetected Chrome that bypasses Cloudflare Turnstile, pierces closed Shadow DOM, with a coherent fingerprint. TypeScript.",
     "author": "Rafael",
     "license": "PolyForm-Noncommercial-1.0.0",
     "packageManager": "pnpm@10.28.1",
@@ -15,26 +15,49 @@
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/eurafaeldecarvalho/libs.git",
-        "directory": "browser-scraper"
+        "url": "git+https://github.com/eurafaeldecarvalho/browser-scraper.git"
     },
-    "homepage": "https://github.com/eurafaeldecarvalho/libs/tree/main/browser-scraper",
+    "homepage": "https://github.com/eurafaeldecarvalho/browser-scraper#readme",
     "bugs": {
-        "url": "https://github.com/eurafaeldecarvalho/libs/issues"
+        "url": "https://github.com/eurafaeldecarvalho/browser-scraper/issues"
     },
     "publishConfig": {
         "access": "public"
     },
     "keywords": [
-        "browser",
         "scraper",
         "scraping",
+        "web-scraping",
+        "web-scraper",
+        "browser-automation",
+        "headless",
+        "headless-chrome",
+        "chromium",
+        "crawler",
+        "stealth",
+        "undetected",
+        "anti-bot",
+        "bot-detection",
+        "anti-detect",
+        "fingerprint",
+        "detection-evasion",
+        "cloudflare",
+        "cloudflare-bypass",
+        "turnstile",
+        "recaptcha",
+        "captcha",
+        "datadome",
         "cdp",
         "chrome-devtools-protocol",
         "shadow-dom",
-        "cloudflare",
-        "turnstile",
-        "automation"
+        "closed-shadow-dom",
+        "runtime-enable",
+        "puppeteer",
+        "playwright",
+        "puppeteer-alternative",
+        "typescript",
+        "nodejs",
+        "lambda"
     ],
     "files": [
         "dist",
