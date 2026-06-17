@@ -15,11 +15,12 @@
     },
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/rafaelgdn/browser-scraper.git"
+        "url": "git+https://github.com/eurafaeldecarvalho/libs.git",
+        "directory": "browser-scraper"
     },
-    "homepage": "https://github.com/rafaelgdn/browser-scraper#readme",
+    "homepage": "https://github.com/eurafaeldecarvalho/libs/tree/main/browser-scraper",
     "bugs": {
-        "url": "https://github.com/rafaelgdn/browser-scraper/issues"
+        "url": "https://github.com/eurafaeldecarvalho/libs/issues"
     },
     "publishConfig": {
         "access": "public"

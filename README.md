@@ -458,7 +458,7 @@ The override runs in the page's main world and keeps `getParameter.toString()` n
 
 ## Cloud deployment (Lambda vs EC2-GPU)
 
-> **The dominant signal is your IP, not your fingerprint.** A flawless headless Chrome on an AWS egress IP still scores low on reCAPTCHA v3 and gets challenged by Cloudflare/DataDome, because datacenter ASNs are penalized *before your JavaScript runs*. Route protected targets through a **residential or mobile proxy**. The library warns on direct egress (`warnOnDirectEgress`) and `browser.checkEgress()` reports whether your exit IP is flagged as hosting.
+> **The dominant signal is your IP, not your fingerprint.** A flawless headless Chrome on an AWS egress IP still scores low on reCAPTCHA v3 and gets challenged by Cloudflare/DataDome, because datacenter ASNs are penalized *before your JavaScript runs*. Route protected targets through a **residential or mobile proxy** — [IPRoyal][iproyal] is the cheapest residential pool I've found that still gets through (paid link); [Bright Data][brightdata] is the premium option for the hardest targets. The library warns on direct egress (`warnOnDirectEgress`) and `browser.checkEgress()` reports whether your exit IP is flagged as hosting.
 
 **Lambda — ZIP runtime + `@sparticuz/chromium` (the supported path).** Real `google-chrome-stable` does **not** run on the Lambda ZIP runtime: it dies under Firecracker's namespace/seccomp sandbox even single-process (`credentials.cc Operation not permitted`, "Zygote could not fork"), and a full Chrome won't fit the ~250 MB unzipped zip limit. Use **`@sparticuz/chromium`** (an *optional* dependency — install + pin it, and keep it **`external`** in your bundler so it resolves its binary by relative path). It ships **chrome-headless-shell**, which is already headless (`--headless='shell'`); the lib detects that via `channel:'headless-shell'` and: never adds `--headless=new`, owns the software-WebGL flags, ensures `HOME`/`XDG_*`/user-data dirs exist under `/tmp`, points `DBUS_SESSION_BUS_ADDRESS` at `/dev/null`, and auto-applies the shell shims (`window.chrome`, `navigator.connection`) that a real headful Chrome has natively.
 
@@ -510,7 +510,8 @@ WebRTC is left enabled (fully disabling it is itself an anomaly) but locked down
 - No JavaScript fingerprint spoofing is injected by default on a normal desktop Chrome: native behavior is harder to detect than patched APIs. The stealth gains come from avoiding `Runtime.enable`, cleaning the headless UA/client-hints, generic world names, careful launch flags, and human-like input. Bring your own patches via `tab.addInitScript` if a target needs them.
 - **Under `channel:'headless-shell'`** the lib applies a small set of **conditional** shims that close two specific shell-only tells — it does **not** claim to make the shell binary indistinguishable from a real headful Chrome. The shims, each a no-op when the value is already real and written to match Chrome's native descriptor shape (enumerable own data property for `window.chrome`; prototype accessors with native-looking `toString` for `navigator.connection`): a minimal `window.chrome`/`chrome.runtime` (only when missing) and a non-zero `navigator.connection.rtt` (only when it reads `0`). Residual shell gaps are deliberately left untouched (a fabricated `navigator.plugins`/WebGPU adapter is itself a tell — see the research doc) and remain soft-target limitations; the dominant lever stays the IP. The lib also threads the **real, live GREASE brand** (read from `navigator.userAgentData`) into the Client-Hints instead of a hard-coded value that rotates stale, and **verifies a WebGL context exists before installing the WebGL string spoof** (a `getParameter`-only spoof is inert — and incoherent — with no context behind it; against render-hash anti-bots like DataDome Picasso it's worse than honest, so keep `spoofWebGL` for soft targets only).
 - WebGL string spoofing is for **soft targets only** — it can't beat a forced render-hash. For hard targets, run a real GPU.
-- The dominant signal is your **IP reputation**, not your fingerprint. Datacenter ASNs lose before the JavaScript runs; use a residential/mobile proxy for protected targets.
+- The dominant signal is your **IP reputation**, not your fingerprint. Datacenter ASNs lose before the JavaScript runs; route protected targets through a residential/mobile proxy ([IPRoyal][iproyal] on a budget, [Bright Data][brightdata] for hard targets — paid links).
+- **This library doesn't solve captchas — by design.** Its posture is IP reputation + human-like behavior, not token forging (forged `_GRECAPTCHA` tokens buy nothing). If a target throws an interactive image/checkbox challenge you genuinely must clear, hand it to a solving service — [2Captcha][2captcha] or [Anti-Captcha][anticaptcha] (paid links). Fix your IP first: a solver on a flagged datacenter IP still loses.
 
 ## Support
 
@@ -521,6 +522,13 @@ This library is built and maintained in the open. If it saved you the work of fi
 
 Starring the repo helps too — it's how other developers find the project.
 
+> Some proxy and captcha links in this README are paid links — I may earn a commission at no extra cost to you. They're tools I'd route my own traffic through.
+
 ## License
 
 [PolyForm Noncommercial 1.0.0](./LICENSE). Free for noncommercial use; contact the author for a commercial license.
+
+[iproyal]: https://iproyal.com/?r=eurafaeldecarvalho
+[brightdata]: https://brightdata.com
+[2captcha]: https://2captcha.com/auth/register/?from=12417190
+[anticaptcha]: https://getcaptchasolution.com/yykljfdcin
