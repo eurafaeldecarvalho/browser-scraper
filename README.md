@@ -33,7 +33,7 @@ With the right setup — a clean residential/mobile IP, plus a real GPU (EC2 `g4
 | Incolumitas | ✅ | Shape / F5 | ✅ |
 | Fingerprint.com | ✅ | AWS WAF Bot Control | ✅ |
 
-> **A ✅ means the fingerprint + behavior layer passes — it is not a guaranteed bypass.** Against hard targets your **IP reputation is the ceiling**: a datacenter ASN loses before the JavaScript runs, so route through a residential/mobile proxy. `browser-scraper` is **not** a CAPTCHA solver — for reCAPTCHA v2 / hCaptcha / Arkose (FunCaptcha) image challenges, pair it with a solver service. It *does* keep reCAPTCHA **v3** scores high via human-like input and warmed profiles.
+> **A ✅ means the fingerprint + behavior layer passes — it is not a guaranteed bypass.** Against hard targets your **IP reputation is the ceiling**: a datacenter ASN loses before the JavaScript runs, so route through a residential/mobile proxy (see [The production stack](#the-production-stack)). `browser-scraper` is **not** a CAPTCHA solver — for reCAPTCHA v2 / hCaptcha / Arkose (FunCaptcha) image challenges, pair it with a solver service. It *does* keep reCAPTCHA **v3** scores high via human-like input and warmed profiles.
 
 > Numbers were taken on a desktop Chrome. On a GPU-less Lambda running **chrome-headless-shell** (`@sparticuz/chromium`) the surfaces differ — re-run the suites against your *actual* production binary and treat that as the source of truth (see [Cloud deployment](#cloud-deployment-lambda-vs-ec2-gpu)).
 
@@ -55,6 +55,7 @@ This is a precision tool, not a magic bypass — it's honest about its edges (se
 - [API reference](#api-reference)
 - [Stealth, in depth](#stealth-in-depth)
 - [WebGL / GPU on cloud hosts](#webgl--gpu-on-cloud-hosts)
+- [The production stack](#the-production-stack) — proxy · VPS · solver
 - [Cloud deployment (Lambda vs EC2-GPU)](#cloud-deployment-lambda-vs-ec2-gpu)
 - [Identity & persistence](#identity--persistence)
 - [WebRTC](#webrtc)
@@ -469,6 +470,20 @@ In `--headless=new`, the library always adds `--enable-unsafe-swiftshader`: Chro
 
 The override runs in the page's main world and keeps `getParameter.toString()` native-looking. Known limitation: it targets the main thread, not Web Workers/OffscreenCanvas.
 
+## The production stack
+
+> **proxy · VPS · solver** — the three things that decide whether a scrape gets through. This library handles the browser; these handle everything around it, and the library's own advice points straight at them. Reader discounts where I could get them.
+
+| You need | Why — straight from this library's own advice | Recommended (with a discount) |
+| --- | --- | --- |
+| **Residential / mobile proxy** | Your **IP reputation is the ceiling** — a datacenter ASN loses before your JavaScript even runs. The single biggest lever. | [IPRoyal][iproyal] — cheapest pool that still gets through · [Bright Data][brightdata] — premium, for the hardest targets |
+| **A VPS to run it 24/7** | Scheduled scrapes want an always-on Linux box, not your laptop. The GPU-less software-WebGL path runs fine here for soft/medium targets. | [Hostinger VPS][hostinger] — **20% off** through this link |
+| **A CAPTCHA solver** (only when forced) | The lib is **not** a solver by design — hand off image/checkbox challenges, and fix your IP first. | [2Captcha][2captcha] · [Anti-Captcha][anticaptcha] |
+
+For **hard, render-hash targets** (DataDome Picasso, Kasada) step up from a cheap VPS to a **real-GPU EC2 `g4dn`/`g5`** and turn `spoofWebGL` off — details in [Cloud deployment](#cloud-deployment-lambda-vs-ec2-gpu) below.
+
+*Proxy, VPS, and captcha links are affiliate/paid links — I may earn a commission at no extra cost to you, and you get the discount. They're the tools I route my own traffic through.*
+
 ## Cloud deployment (Lambda vs EC2-GPU)
 
 > **The dominant signal is your IP, not your fingerprint.** A flawless headless Chrome on an AWS egress IP still scores low on reCAPTCHA v3 and gets challenged by Cloudflare/DataDome, because datacenter ASNs are penalized *before your JavaScript runs*. Route protected targets through a **residential or mobile proxy** — [IPRoyal][iproyal] is the cheapest residential pool I've found that still gets through (paid link); [Bright Data][brightdata] is the premium option for the hardest targets. The library warns on direct egress (`warnOnDirectEgress`) and `browser.checkEgress()` reports whether your exit IP is flagged as hosting.
@@ -491,6 +506,8 @@ const browser = new Browser({
 `geoCountry` must match the proxy's exit country (a UTC clock or `pt-BR` locale on a German IP is a hard tell). If you don't know it ahead of time, set `autoGeo: true` instead of `geoCountry` and the first `newTab()` will look up the exit country **through the proxy** and set it for you (one extra request at startup; explicit `geoCountry`/`timezone`/`locale` always win, and an unmapped country warns rather than guessing).
 
 **EC2 `g4dn`/`g5` (real NVIDIA GPU):** the posture for hard targets. Verify the GPU at `chrome://gpu`, leave `spoofWebGL` **off**, and still use a residential/mobile proxy.
+
+**No AWS? A plain VPS works too.** For soft/medium targets and scheduled jobs, a cheap always-on VPS is the least-effort host — [Hostinger VPS][hostinger] (**20% off** via that link) runs the GPU-less software-WebGL path fine. Same rule applies: pair it with a residential/mobile proxy, and only step up to a real-GPU EC2 box for render-hash-hard targets.
 
 ## Identity & persistence
 
@@ -582,5 +599,6 @@ Starring the repo helps too — it's how other developers find the project.
 
 [iproyal]: https://iproyal.com/?r=eurafaeldecarvalho
 [brightdata]: https://brightdata.com
+[hostinger]: https://www.hostinger.com/br?REFERRALCODE=9PIRAFAELLV8
 [2captcha]: https://2captcha.com/auth/register/?from=12417190
 [anticaptcha]: https://getcaptchasolution.com/yykljfdcin
