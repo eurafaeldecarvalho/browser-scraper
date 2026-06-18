@@ -13,6 +13,12 @@ export { Tab, Dialog, type WaitUntil, type TabStealth } from "./core/tab";
 export { Element } from "./core/element";
 export { CDPClient, CDPError } from "./core/cdp-client";
 export { Network, Request, Response } from "./core/network";
+export {
+  HttpClient,
+  type HttpClientOptions,
+  type HttpRequest,
+  type HttpResponse,
+} from "./core/http";
 export { HumanMouse, getSharedMouse } from "./behavior/mouse";
 export { Keyboard, deriveKey } from "./behavior/keyboard";
 export { ProfileManager, ProfileStore, DEFAULT_HISTORY_SITES } from "./stealth/profile";
@@ -30,4 +36,4 @@ export { buildEvasionSource, type EvasionOptions } from "./stealth/evasions";
 export { ShadowRootAccessor } from "./shadow/shadow-root";
 export { findChrome, getChromeVersion } from "./utils/chrome-finder";
 
-export const __version__ = "0.6.0";
+export const __version__ = "0.6.1";

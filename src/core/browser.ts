@@ -8,6 +8,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { defaultWebglForPlatform, geoForCountry, platformFromUA, type GeoProfile } from "../stealth/persona";
 import { ProfileManager } from "../stealth/profile";
 import { findChrome } from "../utils/chrome-finder";
+import { HttpClient, type HttpClientOptions } from "./http";
 import { Tab, type TabStealth } from "./tab";
 
 // Flags chosen to reduce automation signals WITHOUT introducing new ones.
@@ -132,9 +133,11 @@ type BrowserOptions = {
   // geoCountry automatically (so the persona matches the proxy region without you
   // hardcoding it). Costs one extra request at startup; explicit geo always wins.
   autoGeo?: boolean;
-  // Hardware hint applied engine-level (propagates to workers). deviceMemory is
-  // intentionally NOT spoofable — a main-world-only override would desync from
-  // workers; see stealth/evasions.ts.
+  // Hardware hint applied via Emulation.setHardwareConcurrencyOverride. The
+  // page-session override does NOT reach worker targets, so it is re-issued on
+  // each worker's own session (see Tab._init_worker) to stay coherent main↔worker.
+  // deviceMemory is intentionally NOT spoofable — it has no per-target override and
+  // a main-world-only patch would desync from workers; see stealth/evasions.ts.
   hardwareConcurrency?: number | null;
   // Screen/window geometry reported to the page (fixes headless outerWidth===0).
   screen?: StealthScreen | null;
@@ -337,6 +340,7 @@ export class Browser {
     let webglAuto = false;
     if (this.webglVendor && this.webglRenderer) {
       webgl = { vendor: this.webglVendor, renderer: this.webglRenderer };
+      warn_webgl_os_mismatch(platform, this.webglRenderer);
     } else if (this.spoofWebGL) {
       webgl = defaultWebglForPlatform(platform);
       webglAuto = true; // OS-derived — must follow a later setUserAgent OS switch
@@ -605,6 +609,28 @@ export class Browser {
     }
   }
 
+  // Creates a browserless HTTP fast lane wired to this browser's persona (the
+  // resolved User-Agent + the geo Accept-Language) and proxy, for fetching cheap /
+  // unprotected JSON or HTML endpoints WITHOUT opening a tab. For a real anti-bot
+  // target, pass `curlImpersonate` (a curl-impersonate binary) so the request
+  // carries a GENUINE Chrome TLS/JA3/JA4 + HTTP2 fingerprint through the proxy;
+  // otherwise the Node fetch fallback uses Node's TLS fingerprint (fine for
+  // unprotected endpoints, a tell for hard ones) and refuses a proxy rather than
+  // silently leaking the host TLS/IP. Reuse a warmed session by passing cookies
+  // pulled from a tab (await tab.getCookies()).
+  createHttpClient(options: Partial<HttpClientOptions> = {}): HttpClient {
+    const geo = this._resolve_geo();
+    return new HttpClient({
+      userAgent: options.userAgent ?? this._user_agent ?? this.userAgent,
+      acceptLanguage: options.acceptLanguage ?? geo?.acceptLanguage ?? null,
+      proxy: options.proxy ?? this.proxy,
+      proxyAuth: options.proxyAuth ?? this.proxyAuth,
+      curlImpersonate: options.curlImpersonate ?? null,
+      impersonateTarget: options.impersonateTarget ?? null,
+      timeoutMs: options.timeoutMs,
+    });
+  }
+
   // Resolves geoCountry from the proxy exit country (one-time). Sets the resolved
   // flag FIRST so the throwaway lookup tab created by checkEgress() does not
   // re-enter this path. Leaves geoCountry unset (with a warning) when the country
@@ -772,6 +798,34 @@ export class Browser {
 // session is indistinguishable from a headful one at the UA level.
 function strip_headless_ua(user_agent: string): string {
   return user_agent.replace(/HeadlessChrome/g, "Chrome");
+}
+
+// Warns when an explicit webglRenderer names a GPU backend that contradicts the
+// UA's OS — the single highest-signal WebGL tell. A Direct3D/D3D11 string under a
+// Linux/macOS UA (or a Metal/Apple string under Windows/Linux) is an impossible
+// pair that DataDome Picasso / Cloudflare render cross-checks hard-block. Surface
+// it loudly rather than shipping a coherent-looking-but-impossible identity.
+function warn_webgl_os_mismatch(platform: string, renderer: string): void {
+  const is_windows_gpu = /Direct3D|D3D11|D3D9/i.test(renderer);
+  const is_mac_gpu = /Metal|Apple\sM\d|ANGLE Metal/i.test(renderer);
+  // Mesa/llvmpipe/SwiftShader are Linux/software backends; kept strict (not bare
+  // "OpenGL") so a Windows ANGLE-GL string doesn't false-positive.
+  const is_linux_gpu = /Mesa|llvmpipe|SwiftShader/i.test(renderer);
+
+  let bad = "";
+  if (is_windows_gpu && platform !== "Windows") {
+    bad = "a Windows Direct3D/D3D11";
+  } else if (is_mac_gpu && platform !== "macOS") {
+    bad = "a macOS Metal/Apple";
+  } else if (is_linux_gpu && platform !== "Linux") {
+    bad = "a Linux Mesa/SwiftShader";
+  }
+
+  if (bad) {
+    console.warn(
+      `[browser-scraper] webglRenderer looks like ${bad} GPU but the User-Agent OS is ${platform}. An OS-vs-renderer mismatch (e.g. a D3D11 string under a Linux UA) is a hard block for DataDome Picasso / Cloudflare render cross-checks. Use an OS-coherent renderer (see defaultWebglForPlatform) or drop the explicit WebGL identity.`,
+    );
+  }
 }
 
 function normalize_browser_options(
