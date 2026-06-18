@@ -269,7 +269,7 @@ new Browser({
   timezone: null,         // explicit overrides for the above
   locale: null,
   acceptLanguage: null,
-  hardwareConcurrency: null, // engine-level (propagates to workers)
+  hardwareConcurrency: null, // re-applied per worker session to stay coherent main↔worker
   screen: null,           // { width, height } => device-metrics + window.screen/outerWidth
   windowSize: null,       // { width, height } => --window-size (defaults to screen or 1920x1080)
   evasions: true,         // webdriver / Notification / screen init scripts
@@ -311,6 +311,9 @@ await tab.waitForSelector({ selector, state: "ready", timeout: 30_000 });
 await tab.waitForFunction({ expression, timeout: 30_000 });
 await tab.race({ selectors: [".success"], jsFunctions: ["window.done === true"], visible: false, timeout: 30_000 });
 await tab.evaluate({ expression: "document.title" });
+// Read page-owned globals the isolated world can't see (the page's own window state,
+// the live grecaptcha/turnstile objects). Opt-in; the isolated world is the default.
+await tab.evaluate({ expression: "window.__APP_STATE__", world: "main" });
 await tab.screenshot({ path: "shot.png" });
 await tab.content();
 await tab.sleep({ milliseconds: 2_000 });
@@ -347,6 +350,13 @@ tab.onDialog(async (dialog) => {
 // high-value submit — a "blind execute" with zero prior pointer/scroll activity
 // tanks a reCAPTCHA v3 score.
 await tab.ambientActivity({ durationMs: 1200 });
+
+// Cloudflare Turnstile (INTERACTIVE checkbox): wait for the widget, human-click it,
+// poll for the token. Built on the lib's own primitives (no third-party solver).
+// For an INVISIBLE widget, read the token directly with turnstileToken(). Best
+// behind a residential IP — the click can't rescue a datacenter-IP session.
+const { solved, token } = await tab.solveTurnstile({ timeoutMs: 30_000 });
+const t = await tab.turnstileToken();        // live cf-turnstile-response, or null
 
 // Inject a warmed cookie bundle via CDP (encrypted with the live profile key —
 // unlike the inert SQLite seeding). Each cookie needs a `domain` or `url`.
@@ -387,12 +397,41 @@ tab.network.intercept({
 });
 
 // Observe traffic:
-tab.network.on({ event: "response", handler: (res) => console.log(res.status, res.url) });
+const onResponse = tab.network.on({ event: "response", handler: (res) => console.log(res.status, res.url) });
+
+// Detach handlers. Drain them before teardown so none fires (and issues a CDP
+// command the closing socket would reject) while the connection is going down:
+tab.network.off({ event: "response", handler: onResponse });
+tab.network.removeAllListeners();
 ```
 
 Request blocking composes with an authenticated proxy: a single `Fetch.enable`
 carries both the proxy credential handling and the block rules, so neither
 clobbers the other.
+
+### HTTP fast lane (browserless)
+
+For cheap / unprotected endpoints (JSON APIs, static HTML) you don't always need a
+tab — `browser.createHttpClient()` issues a single request with the browser's
+persona (resolved User-Agent + `Accept-Language`) and proxy, without opening Chrome:
+
+```ts
+const http = browser.createHttpClient({
+  // Optional: a curl-impersonate binary gives a REAL Chrome TLS/JA3/JA4 + HTTP/2
+  // fingerprint through the proxy. WITHOUT it, the Node `fetch` fallback is used
+  // (coherent headers, but Node's TLS — fine for unprotected targets, a tell for
+  // hard ones) and a proxy is REFUSED rather than leaking the host TLS/IP.
+  curlImpersonate: "curl_chrome131",
+});
+
+// Reuse a warmed session by passing cookies pulled from a tab:
+const cookies = Object.fromEntries((await tab.getCookies()).map((c) => [c.name, c.value]));
+const res = await http.get("https://api.example.com/data", { cookies });
+console.log(res.status, res.impersonated, res.body);
+```
+
+It is a complement, not a stealth replacement: for anything behind a real anti-bot,
+drive a tab.
 
 ### Element
 
@@ -432,12 +471,12 @@ The library is built to minimize the signals anti-bot vendors (Cloudflare, DataD
 
 - **No `Runtime.enable`.** All JavaScript runs through `Page.createIsolatedWorld` + `Runtime.evaluate`, plain commands that do not enable the Runtime domain. Context invalidation is handled via `Page.frameNavigated` and stale-context retries. *(Calibration: the best-known probe — the `Error.stack`-getter triggered during inspector serialization — was largely defused by V8's May-2025 patches, so this is no longer the single dominant tell it once was; but avoiding `Runtime.enable` still defeats the other Runtime-domain-dependent signals, e.g. `Runtime.consoleAPICalled`, so it remains a correct invariant.)*
 - **Clean User-Agent + client hints.** In `--headless=new`, Chrome injects `HeadlessChrome` into the UA and `sec-ch-ua`. The library strips it and applies matching `userAgentMetadata` so `navigator.userAgentData` stays consistent.
-- **Generic isolated-world names** (`util`) instead of identifiable ones.
+- **Randomized, per-tab isolated-world names** (a random `u…` token, not a fixed marker like a constant `util` or Playwright's `__playwright_utility_world__`) so the world name can't be pinned as a static cross-session signature if it ever leaks (e.g. via an `Error` stack frame).
 - **Launch flags** avoid options whose mere presence is a fingerprint (`--disable-popup-blocking`, `--disable-component-update`, `--disable-extensions`, `--enable-automation`).
 - **Human-like input.** Mouse moves follow a min-jerk velocity profile with distance-scaled timing, in-flight tremor and ballistic overshoot+correction; typing uses lognormal dwell/flight times with occasional key rollover. `tab.mouse.idle()` adds non-periodic ambient cursor drift (useful before a `grecaptcha.execute()`).
 - **Coherent persona.** UA string, Client-Hints (`platform`, `platformVersion`, real `fullVersionList`, `architecture`), WebGL identity, and geo (timezone/locale/`Accept-Language`) are all derived from one resolved User-Agent so the layers can't contradict each other — a cross-layer mismatch is the highest-signal tell.
 
-A small set of **conditional, defensive** JS patches is injected by default (toggle with `evasions: false`): `navigator.webdriver` is forced to a present `false` getter only if the launch flag didn't already do it; `Notification.permission` is reconciled with `navigator.permissions.query` (the real `PermissionStatus` is returned with only its `state` mapped, so `default` → the valid `prompt`); and `window.screen`/`outerWidth` are normalized into a coherent maximized-window geometry when a `screen`/`windowSize` is set. Each patch keeps its `toString()` native and no-ops when the value was already fine (over-patching a correct value is itself a tell). `navigator.hardwareConcurrency` is set engine-level via CDP so it stays consistent inside workers; `deviceMemory` is deliberately **not** spoofed (a main-world-only override would desync from workers — a stronger tell). Add your own with `tab.addInitScript({ source })`.
+A small set of **conditional, defensive** JS patches is injected by default (toggle with `evasions: false`): `navigator.webdriver` is forced to a present `false` getter only if the launch flag didn't already do it; `Notification.permission` is reconciled with `navigator.permissions.query` (the real `PermissionStatus` is returned with only its `state` mapped, so `default` → the valid `prompt`); and `window.screen`/`outerWidth` are normalized into a coherent maximized-window geometry when a `screen`/`windowSize` is set. Each patch keeps its `toString()` native and no-ops when the value was already fine (over-patching a correct value is itself a tell). `navigator.hardwareConcurrency` is pinned via `Emulation.setHardwareConcurrencyOverride`; that page-session override does **not** reach worker targets, so the library re-issues it on each worker's own CDP session (and resumes the worker, which would otherwise hang paused under auto-attach) — keeping `navigator.hardwareConcurrency` coherent between the main thread and Web/Shared/Service Workers, since a main-vs-worker mismatch is a stronger tell than the value itself. `deviceMemory` is deliberately **not** spoofed (it has no per-target override, so a main-world-only patch would desync from workers). Add your own with `tab.addInitScript({ source })`.
 
 Audited against `bot-detector.rebrowser.net` (no `runtimeEnableLeak`, no `navigatorWebdriver`, isolated-world execution), `bot.sannysoft.com` (0 failures), and CreepJS (0% headless, 0% stealth).
 
@@ -447,7 +486,7 @@ Audited against `bot-detector.rebrowser.net` (no `runtimeEnableLeak`, no `naviga
 
 On your machine WebGL reports your real GPU. On a **GPU-less cloud server, Chrome falls back to SwiftShader/llvmpipe**, and `SwiftShader` / `llvmpipe` in the renderer is a known headless signal. But the spoof has two sharp edges you must respect:
 
-1. **Never claim an OS the renderer can't belong to.** A `Direct3D11`/`D3D11` renderer string exists **only on Windows**. Emitting it under a Linux UA is an *impossible* combination that DataDome/Picasso hard-blocks — strictly worse than the honest software string. `spoofWebGL: true` now derives an **OS-coherent** default from the resolved UA (Linux→Mesa/ANGLE OpenGL, Windows→D3D11, macOS→Metal); it will never put a Windows GPU on a Linux UA.
+1. **Never claim an OS the renderer can't belong to.** A `Direct3D11`/`D3D11` renderer string exists **only on Windows**. Emitting it under a Linux UA is an *impossible* combination that DataDome/Picasso hard-blocks — strictly worse than the honest software string. `spoofWebGL: true` now derives an **OS-coherent** default from the resolved UA (Linux→Mesa/ANGLE OpenGL, Windows→D3D11, macOS→Metal); it will never put a Windows GPU on a Linux UA. If you pass an explicit `webglRenderer`, the library **warns** when its backend contradicts the UA's OS (a D3D11 string under Linux/macOS, a Mesa/SwiftShader string under Windows/macOS, a Metal string under Windows/Linux).
 2. **A `getParameter`-only spoof can't beat a forced render.** The override changes the vendor/renderer *strings*, but the extension list, parameter limits, and the actual rendered pixel hash still come from SwiftShader. Top-tier antibots (DataDome Picasso, Cloudflare, Kasada) force a render and cross-check, so a discrete-GPU string under software rendering is detectable. **The spoof is for soft targets only.**
 
 ```ts
@@ -556,7 +595,7 @@ This is a precision tool, not a magic captcha bypass: against hard targets (Clou
 The detectable tells are the `Runtime.enable` CDP leak, the `HeadlessChrome` User-Agent/client-hints, and cross-layer fingerprint mismatches. This library avoids `Runtime.enable` entirely (all JS runs via `Page.createIsolatedWorld` + `Runtime.evaluate`), strips the headless UA, and derives one coherent persona — see [Stealth, in depth](#stealth-in-depth). Verified against `bot.sannysoft.com` (0 failures), CreepJS (0% headless), and `bot-detector.rebrowser.net`.
 
 ### How do I bypass Cloudflare Turnstile in Node.js?
-The Turnstile checkbox usually lives inside a sandboxed, cross-origin iframe. A single `find()` reaches it (and any closed shadow root) so you can `click()` it like a real user — see [Pierce closed Shadow DOM + cross-origin iframes](#pierce-closed-shadow-dom-and-cross-origin-iframes-with-one-find) and the `examples/cloudflare-turnstile.ts` example. Behind a clean residential IP this passes Cloudflare's interstitial; the IP, not the click, is the dominant factor.
+The Turnstile checkbox usually lives inside a sandboxed, cross-origin iframe. A single `find()` reaches it (and any closed shadow root) so you can `click()` it like a real user — or call `tab.solveTurnstile()` for the one-call path (it waits for the widget, human-clicks the checkbox, and polls for the token). See [Pierce closed Shadow DOM + cross-origin iframes](#pierce-closed-shadow-dom-and-cross-origin-iframes-with-one-find) and the `examples/cloudflare-turnstile.ts` example. Behind a clean residential IP this passes Cloudflare's interstitial; the IP, not the click, is the dominant factor.
 
 ### How do I access or query a closed Shadow DOM?
 Puppeteer and Playwright [cannot pierce **closed** shadow roots](https://github.com/microsoft/playwright/issues/23047). `find()` / `findAll()` search the main document, closed shadow roots, and cross-origin (OOP) iframes in one call — no `shadowRoot` walking, no frame plumbing.
