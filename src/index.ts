@@ -36,4 +36,4 @@ export { buildEvasionSource, type EvasionOptions } from "./stealth/evasions";
 export { ShadowRootAccessor } from "./shadow/shadow-root";
 export { findChrome, getChromeVersion } from "./utils/chrome-finder";
 
-export const __version__ = "0.6.1";
+export const __version__ = "0.7.0";

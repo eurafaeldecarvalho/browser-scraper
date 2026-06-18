@@ -1,6 +1,6 @@
 {
     "name": "@eurafaeldecarvalho/browser-scraper",
-    "version": "0.6.0",
+    "version": "0.7.0",
     "description": "Stealth browser automation & web scraping for Node.js. CDP-first, undetected Chrome that bypasses Cloudflare Turnstile, pierces closed Shadow DOM, with a coherent fingerprint. TypeScript.",
     "author": "Rafael",
     "license": "PolyForm-Noncommercial-1.0.0",
@@ -81,7 +81,8 @@
         "example:webgl": "tsx examples/webgl-check.ts",
         "example:detection": "tsx examples/detection-test.ts",
         "example:cloudflare": "tsx examples/cloudflare-turnstile.ts",
-        "example:cloudflare-click": "tsx examples/cloudflare-turnstile-click.ts"
+        "example:cloudflare-click": "tsx examples/cloudflare-turnstile-click.ts",
+        "example:smoke": "tsx examples/smoke-optionB.ts"
     },
     "engines": {
         "node": ">=20.0.0"
