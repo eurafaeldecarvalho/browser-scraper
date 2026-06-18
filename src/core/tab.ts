@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -52,6 +53,13 @@ export class Tab {
   private _cdp: CDPClient;
   private _frame_id: string | null = null;
   private _execution_context_id: number | null = null;
+  // Per-tab random isolated-world name. A FIXED magic string (the old constant
+  // "util", also Playwright's "__playwright_utility_world__") is a static,
+  // cross-session signature a detector can pin if it ever leaks (e.g. via an
+  // Error stack frame). Isolated worlds are not directly enumerable from the
+  // page, so this is cheap hardening, not a load-bearing defense — but a random
+  // per-tab name removes the constant at no cost.
+  private readonly _world_name = `u${randomBytes(8).toString("hex")}`;
   private _oop_frame_sessions = new Map<string, string>();
   private _network: Network | null = null;
   private _proxy_auth: [string, string] | null;
@@ -164,6 +172,66 @@ export class Tab {
     if (target_type === "iframe" && session_id && target_id) {
       this._oop_frame_sessions.set(target_id, session_id);
       void this._init_oop_frame(session_id);
+      return;
+    }
+
+    if (!session_id) {
+      return;
+    }
+
+    // Workers/worklets auto-attach PAUSED because we pass waitForDebuggerOnStart:
+    // true (so OOP iframes are set up before they run). Unlike an iframe we inject
+    // nothing into a worker — we just MUST resume it, or it hangs at start forever:
+    // the page's Web Worker never executes, which both breaks the target site's
+    // functionality AND is a detectable anomaly (a real browser runs its workers;
+    // navigator.hardwareConcurrency reads coherently inside them via the
+    // engine-level Emulation.setHardwareConcurrencyOverride). _init_worker also
+    // re-issues that override on the worker's own session, then resumes it.
+    if (target_type === "worker" || target_type === "shared_worker" || target_type === "service_worker" || target_type === "worklet") {
+      void this._init_worker(session_id);
+      return;
+    }
+
+    // Any OTHER auto-attached target would ALSO hang paused under
+    // waitForDebuggerOnStart — most notably a window.open()/target=_blank popup,
+    // which attaches as a 'page' target. We don't drive it as a managed Tab, but a
+    // permanently-paused popup both breaks the site flow and is a detectable
+    // anomaly, so resume it. runIfWaitingForDebugger is a harmless no-op if the
+    // target wasn't actually waiting.
+    void this._resume_target(session_id);
+  }
+
+  // Sets up a freshly-attached (paused) worker, then resumes it. The page-session
+  // Emulation.setHardwareConcurrencyOverride does NOT reach worker targets (they
+  // are separate CDP targets), so a hardwareConcurrency spoof would otherwise leave
+  // navigator.hardwareConcurrency at the REAL value inside workers — a main-vs-worker
+  // mismatch that CreepJS-class detectors read off WorkerNavigator. Re-issue the
+  // override on the WORKER's own session while it is still paused so the worker
+  // reports the same value natively. (deviceMemory is deliberately NOT spoofed
+  // anywhere, so it stays coherent main↔worker on its own.)
+  private async _init_worker(session_id: string): Promise<void> {
+    const cores = this._stealth.hardwareConcurrency;
+    if (typeof cores === "number" && cores > 0) {
+      try {
+        await this._cdp.send("Emulation.setHardwareConcurrencyOverride", { hardwareConcurrency: cores }, session_id);
+      } catch (error) {
+        if (!(error instanceof CDPError)) {
+          throw error;
+        }
+      }
+    }
+    await this._resume_target(session_id);
+  }
+
+  // Resumes a target paused by waitForDebuggerOnStart (best-effort; a worker that
+  // finished/detached before we resume just errors harmlessly).
+  private async _resume_target(session_id: string): Promise<void> {
+    try {
+      await this._cdp.send("Runtime.runIfWaitingForDebugger", {}, session_id);
+    } catch (error) {
+      if (!(error instanceof CDPError)) {
+        throw error;
+      }
     }
   }
 
@@ -344,10 +412,14 @@ export class Tab {
     }
   }
 
-  // Pins navigator.hardwareConcurrency at the ENGINE level so the value
-  // propagates to web workers too (a main-vs-worker mismatch is a stronger tell
-  // than the value itself). deviceMemory has no such CDP override and is
-  // deliberately NOT spoofed — a main-world-only patch would desync from workers.
+  // Pins navigator.hardwareConcurrency via Emulation.setHardwareConcurrencyOverride
+  // on the page session. NOTE: this override does NOT automatically reach worker
+  // targets — verified on current Chrome, a page-session override leaves
+  // navigator.hardwareConcurrency at the REAL value inside workers — so _init_worker
+  // re-issues it on each worker's own session to keep main↔worker coherent (a
+  // main-vs-worker mismatch is a stronger tell than the value itself). deviceMemory
+  // has no CDP override and is deliberately NOT spoofed — it stays real and so is
+  // coherent across main and workers on its own.
   private async _apply_hardware_override(): Promise<void> {
     const cores = this._stealth.hardwareConcurrency;
     if (typeof cores !== "number" || cores <= 0) {
@@ -508,7 +580,7 @@ export class Tab {
       try {
         const result = await this._cdp.send("Page.createIsolatedWorld", {
           frameId: frame_id,
-          worldName: "util",
+          worldName: this._world_name,
         });
 
         const execution_context_id = Number(result.executionContextId ?? 0);
@@ -808,7 +880,11 @@ export class Tab {
     return String(html.outerHTML ?? "");
   }
 
-  async evaluate({ expression }: { expression: string }): Promise<any> {
+  async evaluate({ expression, world = "isolated" }: { expression: string; world?: "isolated" | "main" }): Promise<any> {
+    if (world === "main") {
+      return this._evaluate_main_world(expression);
+    }
+
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const context_id = await this._ensure_execution_context();
 
@@ -837,6 +913,48 @@ export class Tab {
     }
 
     throw new Error("Failed to evaluate JavaScript in the active execution context");
+  }
+
+  // Runs JS in the page's MAIN world (its own global scope) instead of the
+  // isolated world, so it can read what the page's own scripts put on `window`
+  // (app/framework state, the live `turnstile` / `grecaptcha` objects, etc.) that
+  // an isolated world cannot see. Uses Runtime.evaluate with NO contextId, which
+  // targets the top frame's DEFAULT (main-world) context — so it needs neither
+  // Runtime.enable (the CDP automation tell we deliberately avoid; see connect())
+  // nor the addBinding handshake rebrowser-patches uses: a raw-CDP driver reaches
+  // the main world directly, unlike Puppeteer/Playwright which only learn the
+  // context id from Runtime.executionContextCreated (gated behind Runtime.enable).
+  // This is the SAME primitive _capture_grease / _webgl_context_available already
+  // rely on. NOTE: main-world execution IS observable by the page (a page can trap
+  // its own globals), so the isolated world stays the default — opt into "main"
+  // only when you must read page JS state.
+  private async _evaluate_main_world(expression: string): Promise<any> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const result = await this._cdp.send("Runtime.evaluate", {
+          expression,
+          returnByValue: true,
+          awaitPromise: true,
+        });
+
+        if (result.exceptionDetails) {
+          throw new Error(`JavaScript error: ${String(result.exceptionDetails.text ?? "Unknown error")}`);
+        }
+
+        return result.result?.value;
+      } catch (error) {
+        // Mid-navigation the default context can be momentarily torn down/recreated.
+        // There is no contextId to invalidate here (Chrome re-resolves the default
+        // context on the next call), so just retry once — matching the isolated path.
+        if (attempt === 0 && this._is_stale_execution_context_error(error)) {
+          await delay(50);
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw new Error("Failed to evaluate JavaScript in the main world");
   }
 
   async find({ selector, timeout = 5_000 }: { selector: string; timeout?: number }): Promise<Element | null> {
@@ -1223,7 +1341,7 @@ export class Tab {
 
       const world_result = await this._cdp.send("Page.createIsolatedWorld", {
         frameId: frame_id,
-        worldName: "util",
+        worldName: this._world_name,
       });
 
       const context_id = Number(world_result.executionContextId ?? 0);
@@ -1689,6 +1807,138 @@ export class Tab {
     } catch {
       // Best-effort: ambient motion failing must never abort the real action.
     }
+  }
+
+  // Reads the live cf-turnstile-response token from the DOM, or null when it is
+  // absent / empty / still the demo "DUMMY" placeholder. Reads the live `.value`
+  // (not the static attribute), and works for both an invisible widget (token
+  // minted with no click) and the interactive one. The real token lives in
+  // Cloudflare's cross-origin iframe for some demos, so a placeholder here does
+  // NOT always mean failure — pair it with the widget reaching its success state
+  // (see solveTurnstile).
+  async turnstileToken(): Promise<string | null> {
+    const token = await this.evaluate({
+      expression: `
+        (() => {
+          const el = document.querySelector("input[name='cf-turnstile-response'], textarea[name='cf-turnstile-response']");
+          return el && el.value ? el.value : "";
+        })()
+      `,
+    });
+
+    if (typeof token !== "string") {
+      return null;
+    }
+    const trimmed = token.trim();
+    if (trimmed.length <= 30 || trimmed.toUpperCase().includes("DUMMY")) {
+      return null;
+    }
+    return trimmed;
+  }
+
+  // True when a Cloudflare Turnstile widget is present on the page — its response
+  // input, the `.cf-turnstile` container, or the challenges.cloudflare.com iframe
+  // (the <iframe> element's `src` is readable cross-origin; only its contentDocument
+  // is not). solveTurnstile uses this to AVOID clicking unrelated checkboxes on a
+  // page that has no Turnstile (or an invisible widget that mints a token without a
+  // checkbox). Read from the isolated world — all of these are host-page DOM.
+  async turnstilePresent(): Promise<boolean> {
+    const present = await this.evaluate({
+      expression: `
+        (() => !!(
+          document.querySelector("input[name='cf-turnstile-response'], textarea[name='cf-turnstile-response'], .cf-turnstile, #cf-turnstile")
+          || Array.from(document.querySelectorAll('iframe')).some((f) => ((f.src || '') + '').includes('challenges.cloudflare.com'))
+        ))()
+      `,
+    });
+    return Boolean(present);
+  }
+
+  // Solves an INTERACTIVE Cloudflare Turnstile (the managed checkbox) using only
+  // this lib's own primitives — no third-party solver. It waits for the widget to
+  // be present, pierces to its checkbox (closed shadow DOM + cross-origin iframe,
+  // both handled by find()), warms up with a short ambient cursor burst (a blind
+  // instant click reads as a bot to Turnstile's behavioral layer), human-clicks it,
+  // then polls for either the minted token or the checkbox collapsing into the
+  // "Success!" state. An already-solved widget short-circuits. Returns
+  // { solved, token }; token may be null even when solved if the token stays inside
+  // Cloudflare's cross-origin iframe (the main-page input keeps a placeholder —
+  // common on demo pages).
+  //
+  // SCOPE / LIMITATIONS:
+  // - INTERACTIVE checkbox only. An invisible/non-interactive Turnstile mints its
+  //   token without a checkbox — read it with turnstileToken() (or poll a page
+  //   success flag via evaluate({ world: "main" })) instead of calling this.
+  // - The checkbox is matched by input[type=checkbox]; if the page has OTHER
+  //   checkboxes ahead of the widget in DOM order, find() may return the wrong one.
+  //   For such pages, drive the click yourself against a scoped selector.
+  // - Best run behind a residential proxy: the click cannot rescue a datacenter-IP
+  //   / low-reputation session.
+  async solveTurnstile({
+    timeoutMs = 30_000,
+    attempts = 3,
+  }: { timeoutMs?: number; attempts?: number } = {}): Promise<{ solved: boolean; token: string | null }> {
+    const deadline = Date.now() + timeoutMs;
+    const remaining = (): number => Math.max(0, deadline - Date.now());
+
+    const existing = await this.turnstileToken();
+    if (existing) {
+      return { solved: true, token: existing };
+    }
+
+    for (let attempt = 0; attempt < attempts && remaining() > 0; attempt += 1) {
+      // Don't click stray checkboxes on a page with no Turnstile (or one whose
+      // widget hasn't rendered yet) — wait for the widget to appear first.
+      if (!(await this.turnstilePresent())) {
+        await this.sleep({ milliseconds: 1_000 });
+        continue;
+      }
+
+      // Clamp the find timeout to the remaining budget so the method honors
+      // timeoutMs instead of overrunning on find()'s own default.
+      const find_timeout = Math.min(8_000, remaining());
+      if (find_timeout <= 0) {
+        break;
+      }
+      const checkbox = await this.find({ selector: "input[type='checkbox']", timeout: find_timeout });
+      if (!checkbox) {
+        await this.sleep({ milliseconds: 1_000 });
+        continue;
+      }
+
+      try {
+        // Give Turnstile some human pointer history before the click, then click
+        // the checkbox through our human-input engine (Bézier + dwell), via the
+        // pierced cross-origin-iframe element so the coordinates are translated.
+        // Both steps can throw if the widget re-renders (Turnstile swaps its
+        // iframe / checkbox node) — on a transient failure consume the attempt
+        // and retry rather than rejecting the whole solve.
+        await this.ambientActivity({ durationMs: 800, scroll: false });
+        await checkbox.click();
+      } catch {
+        await this.sleep({ milliseconds: 1_000 });
+        continue;
+      }
+
+      // Bound each attempt so a stuck widget frees the remaining attempts to
+      // re-click instead of one attempt consuming the whole timeout.
+      const attempt_deadline = Math.min(deadline, Date.now() + 10_000);
+      while (Date.now() < attempt_deadline) {
+        await this.sleep({ milliseconds: 1_000 });
+
+        const token = await this.turnstileToken();
+        if (token) {
+          return { solved: true, token };
+        }
+
+        const still_there = await this.find({ selector: "input[type='checkbox']", timeout: 1_000 });
+        if (!still_there) {
+          return { solved: true, token: await this.turnstileToken() };
+        }
+      }
+    }
+
+    return { solved: false, token: await this.turnstileToken() };
   }
 
   async setExtraHeaders({ headers }: { headers: Record<string, string> }): Promise<void> {

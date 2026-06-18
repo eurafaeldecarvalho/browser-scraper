@@ -8,11 +8,14 @@
 //   * toString-native — wrapped callables use an apply-trap Proxy, which V8
 //     reports as "[native code]", matching the existing WebGL override.
 //
-// NOTE: deviceMemory is deliberately NOT patched. There is no CDP override for
-// it (unlike Emulation.setHardwareConcurrencyOverride, which propagates to
-// workers), so a main-world-only getter would MANUFACTURE a main-vs-worker
-// mismatch — a stronger tell than the real low value — and rewriting worker
-// sources to fix that would risk breaking the target's own workers.
+// NOTE: deviceMemory is deliberately NOT patched. It has NO CDP override at all,
+// so a main-world-only getter would MANUFACTURE a main-vs-worker mismatch — a
+// stronger tell than the real low value — and rewriting worker sources to fix that
+// would risk breaking the target's own workers. (hardwareConcurrency, by contrast,
+// IS spoofable coherently: Emulation.setHardwareConcurrencyOverride does NOT
+// auto-propagate to worker targets, so it is re-issued on each worker's own CDP
+// session — see Tab._init_worker — keeping main↔worker in sync; deviceMemory has no
+// such per-target override, so it is left real.)
 
 export type EvasionOptions = {
   webdriver?: boolean;
