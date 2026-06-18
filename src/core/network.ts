@@ -321,7 +321,11 @@ export class Network {
         throw new Error(`Unknown event: ${event}`);
       }
 
-      void this.enable();
+      // Fire-and-forget: enable() awaits a CDP send that rejects if the socket is
+      // closing/dead. Swallow that here so it can't become a fatal
+      // unhandledRejection (the same class the CDP dispatch guards close); a real
+      // send failure still surfaces when the caller next uses the connection.
+      void this.enable().catch(() => {});
       return fn;
     };
 
@@ -330,6 +334,32 @@ export class Network {
     }
 
     return register;
+  }
+
+  // Detaches a previously-registered event handler. Lets a consumer drain its
+  // listeners BEFORE Browser/Tab teardown so a handler can't fire (and issue a
+  // CDP command that the closing socket rejects) during the disconnect — the
+  // class of fire-and-forget rejection that, unhandled, can fail a Lambda run.
+  off({ event, handler }: { event: "request" | "response" | "finished" | "failed"; handler: Handler<any> }): void {
+    if (event === "request") {
+      this._request_handlers = this._request_handlers.filter((candidate) => candidate !== handler);
+    } else if (event === "response") {
+      this._response_handlers = this._response_handlers.filter((candidate) => candidate !== handler);
+    } else if (event === "finished") {
+      this._loading_finished_handlers = this._loading_finished_handlers.filter((candidate) => candidate !== handler);
+    } else if (event === "failed") {
+      this._loading_failed_handlers = this._loading_failed_handlers.filter((candidate) => candidate !== handler);
+    }
+  }
+
+  // Drops ALL request/response/finished/failed listeners (not the interception /
+  // proxy-auth rules). Call on teardown to guarantee no event handler runs while
+  // the CDP socket is closing.
+  removeAllListeners(): void {
+    this._request_handlers = [];
+    this._response_handlers = [];
+    this._loading_finished_handlers = [];
+    this._loading_failed_handlers = [];
   }
 
   intercept({
@@ -343,7 +373,9 @@ export class Network {
   }): any {
     const register = <T extends Handler<[Request]>>(fn: T): T => {
       this._intercept_handlers.push({ pattern, resourceType, handler: fn });
-      void this._enable_fetch_now();
+      // Fire-and-forget enable: swallow a closing-socket rejection so it can't
+      // escape as a fatal unhandledRejection (see on()).
+      void this._enable_fetch_now().catch(() => {});
       return fn;
     };
 

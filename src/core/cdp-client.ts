@@ -70,7 +70,11 @@ export class CDPClient {
     this._disconnect_notified = false;
 
     this._ws.on("message", (message: RawData) => {
-      void this._handle_message(message.toString());
+      // The message pump is fire-and-forget; a rejection here (e.g. an event
+      // handler that throws while Chrome is dying) must never escape as a fatal
+      // unhandledRejection — which the AWS Lambda runtime turns into a failed
+      // invocation. _dispatch_event also guards each handler individually.
+      void this._handle_message(message.toString()).catch(() => {});
     });
 
     this._ws.on("close", () => {
@@ -267,7 +271,17 @@ export class CDPClient {
   private async _dispatch_event(event: string, params: Record<string, unknown>): Promise<void> {
     const handlers = this._event_handlers.get(event) ?? [];
     for (const handler of handlers) {
-      await handler(params);
+      try {
+        await handler(params);
+      } catch {
+        // A CDP event handler that throws/rejects — most commonly a CDP command
+        // it issued (e.g. a `network.on('response')` body read, or a
+        // `blockResources` continue/abort) being rejected by a mid-run Chrome
+        // death or a graceful disconnect — must NOT bubble up to the un-awaited
+        // message pump and surface as a fatal unhandledRejection. The disconnect
+        // path already rejects every in-flight command with a typed CDPError that
+        // awaited callers receive; an event handler's failure is swallowed here.
+      }
     }
   }
 }
