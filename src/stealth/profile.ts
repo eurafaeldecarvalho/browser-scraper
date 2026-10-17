@@ -2,7 +2,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
-import Database from "better-sqlite3";
+import { openSqlite } from "../utils/sqlite";
 
 export type HistorySite = [string, string, number];
 
@@ -82,7 +82,7 @@ export class ProfileManager {
   } = {}): void {
     const history_sites = sites ?? DEFAULT_HISTORY_SITES;
     const history_db = join(this.default_dir, "History");
-    const db = new Database(history_db);
+    const db = openSqlite(history_db);
 
     try {
       db.exec(`
@@ -172,7 +172,7 @@ export class ProfileManager {
     );
     const generated_cookies = cookies ?? this._generate_default_cookies();
     const cookies_db = join(this.default_dir, "Cookies");
-    const db = new Database(cookies_db);
+    const db = openSqlite(cookies_db);
 
     try {
       db.exec(`
