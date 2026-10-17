@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run check
+      - run: pnpm test
+      - run: pnpm run build
+      - name: ESM + CJS import smoke
+        run: |
+          node --input-type=module -e "import { scrape } from '@eurafaeldecarvalho/browser-scraper'; import { extract } from '@eurafaeldecarvalho/browser-scraper/ai'; if (typeof scrape !== 'function' || typeof extract !== 'function') process.exit(1)"
+          node -e "require('@eurafaeldecarvalho/browser-scraper'); require('@eurafaeldecarvalho/browser-scraper/ai')"
+          node dist/cli.js --version
+      - name: E2E (real Chrome)
+        run: xvfb-run --auto-servernum pnpm run test:e2e
+        env:
+          CHROME_PATH: /usr/bin/google-chrome
+
+  node20:
+    name: Node 20 (build + import)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+      - run: node -e "require('@eurafaeldecarvalho/browser-scraper')"
