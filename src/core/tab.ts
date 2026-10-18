@@ -17,6 +17,10 @@ import { findFirst, fromCdpNode, textOf, type ContentElement } from "../content/
 export type WaitUntil = "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 export type WaitForSelectorState = "attached" | "visible" | "hidden" | "ready";
 
+// One rendered Turnstile widget: its OOP iframe target, the owner <iframe> node in
+// the host page, and that widget's own cf-turnstile-response value (solveTurnstile).
+type TurnstileWidget = { targetId: string; backendNodeId: number; inViewport: boolean; hasResponseField: boolean; response: string | null };
+
 type ProtocolLifecycleEvent = "load" | "DOMContentLoaded" | "networkIdle" | "networkAlmostIdle";
 
 const WAIT_UNTIL_TO_PROTOCOL_EVENT: Record<WaitUntil, ProtocolLifecycleEvent> = {
@@ -240,7 +244,33 @@ export class Tab {
     }
   }
 
+  // Sets up a freshly-attached (paused) OOP iframe, then resumes it. The page
+  // session's UA / client-hint override does NOT reach out-of-process iframes —
+  // they are separate targets — so without re-issuing it here a cross-site frame
+  // (Cloudflare Turnstile's challenges.cloudflare.com widget, most notably) reads
+  // the REAL navigator.userAgent, i.e. "HeadlessChrome/…" under headless, and
+  // sends it on its own requests. Same for the hardwareConcurrency override.
   private async _init_oop_frame(session_id: string): Promise<void> {
+    try {
+      if (this._user_agent) {
+        await this._cdp.send(
+          "Emulation.setUserAgentOverride",
+          {
+            userAgent: this._user_agent,
+            userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version, this._grease),
+          },
+          session_id,
+        );
+      }
+      const cores = this._stealth.hardwareConcurrency;
+      if (typeof cores === "number" && cores > 0) {
+        await this._cdp.send("Emulation.setHardwareConcurrencyOverride", { hardwareConcurrency: cores }, session_id);
+      }
+    } catch (error) {
+      if (!(error instanceof CDPError)) {
+        throw error;
+      }
+    }
     try {
       await this._cdp.send("DOM.enable", {}, session_id);
       await this._cdp.send("Runtime.runIfWaitingForDebugger", {}, session_id);
@@ -2010,14 +2040,7 @@ export class Tab {
       `,
     });
 
-    if (typeof token !== "string") {
-      return null;
-    }
-    const trimmed = token.trim();
-    if (trimmed.length <= 30 || trimmed.toUpperCase().includes("DUMMY")) {
-      return null;
-    }
-    return trimmed;
+    return typeof token === "string" ? real_turnstile_token(token) : null;
   }
 
   // True when a Cloudflare Turnstile widget is present on the page — its response
@@ -2039,23 +2062,29 @@ export class Tab {
   }
 
   // Solves an INTERACTIVE Cloudflare Turnstile (the managed checkbox) using only
-  // this lib's own primitives — no third-party solver. It waits for the widget to
-  // be present, pierces to its checkbox (closed shadow DOM + cross-origin iframe,
-  // both handled by find()), warms up with a short ambient cursor burst (a blind
-  // instant click reads as a bot to Turnstile's behavioral layer), human-clicks it,
-  // then polls for either the minted token or the checkbox collapsing into the
-  // "Success!" state. An already-solved widget short-circuits. Returns
-  // { solved, token }; token may be null even when solved if the token stays inside
-  // Cloudflare's cross-origin iframe (the main-page input keeps a placeholder —
-  // common on demo pages).
+  // this lib's own primitives — no third-party solver. The solve is scoped to ONE
+  // widget at a time: pages often render several (responsive duplicates, one of
+  // them hidden or positioned off-screen), and a page-wide "is there a checkbox?"
+  // both clicks the wrong one and never sees the clicked one succeed. So it lists
+  // the widgets (each Turnstile OOP iframe + its own cf-turnstile-response input),
+  // picks one that is rendered and in the viewport with a VISIBLE checkbox, warms
+  // up with a short ambient cursor burst (a blind instant click reads as a bot to
+  // Turnstile's behavioral layer), human-clicks it, then polls THAT widget until
+  // its response input is filled and its checkbox is gone.
+  //
+  // Returns { solved, token }. token is the minted token, or null when it is not a
+  // real one: Cloudflare's TEST sitekeys (the "Testing only" widget footer — e.g.
+  // nowsecure.nl) mint the literal "XXXX.DUMMY.TOKEN.XXXX", which solves the widget
+  // (solved: true) but is not a usable token; and some demos keep the real token
+  // inside Cloudflare's cross-origin iframe.
   //
   // SCOPE / LIMITATIONS:
-  // - INTERACTIVE checkbox only. An invisible/non-interactive Turnstile mints its
-  //   token without a checkbox — read it with turnstileToken() (or poll a page
-  //   success flag via evaluate({ world: "main" })) instead of calling this.
-  // - The checkbox is matched by input[type=checkbox]; if the page has OTHER
-  //   checkboxes ahead of the widget in DOM order, find() may return the wrong one.
-  //   For such pages, drive the click yourself against a scoped selector.
+  // - INTERACTIVE checkbox only. A widget that passes with no checkbox (invisible /
+  //   non-interactive, or the always-pass test key) is reported solved once its
+  //   response input fills; read the token with turnstileToken().
+  // - A widget rendered with response-field:false has no input to read, so success
+  //   falls back to its checkbox staying gone after the click (a failed widget also
+  //   hides its checkbox — verify on the page itself for such sites).
   // - Best run behind a residential proxy: the click cannot rescue a datacenter-IP
   //   / low-reputation session.
   async solveTurnstile({
@@ -2070,7 +2099,8 @@ export class Tab {
       return { solved: true, token: existing };
     }
 
-    for (let attempt = 0; attempt < attempts && remaining() > 0; attempt += 1) {
+    let clicks = 0;
+    while (clicks < attempts && remaining() > 0) {
       // Don't click stray checkboxes on a page with no Turnstile (or one whose
       // widget hasn't rendered yet) — wait for the widget to appear first.
       if (!(await this.turnstilePresent())) {
@@ -2078,27 +2108,59 @@ export class Tab {
         continue;
       }
 
-      // Clamp the find timeout to the remaining budget so the method honors
-      // timeoutMs instead of overrunning on find()'s own default.
-      const find_timeout = Math.min(8_000, remaining());
-      if (find_timeout <= 0) {
-        break;
+      let target: { widget: TurnstileWidget; checkbox: Element } | null = null;
+      for (const widget of await this._turnstile_widgets()) {
+        const checkbox = await this._turnstile_checkbox(widget);
+        // A widget that already passed (test key / non-interactive) has its
+        // response filled and no checkbox left to click.
+        if (!checkbox && widget.response) {
+          return { solved: true, token: real_turnstile_token(widget.response) };
+        }
+        if (!checkbox || target) {
+          continue;
+        }
+        if (!widget.inViewport) {
+          // Below the fold: bring it into view, then re-measure and re-find the
+          // checkbox (its click coordinates include the iframe's offset). A widget
+          // parked off-screen (negative offset) stays out of view and is skipped.
+          await this._cdp.send("DOM.scrollIntoViewIfNeeded", { backendNodeId: widget.backendNodeId }).catch(() => {});
+          const moved = await this._turnstile_widget(widget.backendNodeId, widget.targetId);
+          const refound = moved?.inViewport ? await this._turnstile_checkbox(moved) : null;
+          if (moved && refound) {
+            target = { widget: moved, checkbox: refound };
+          }
+          continue;
+        }
+        target = { widget, checkbox };
       }
-      const checkbox = await this.find({ selector: "input[type='checkbox']", timeout: find_timeout });
-      if (!checkbox) {
+
+      if (!target) {
+        // Still loading / verifying, or every checkbox is hidden off-screen.
         await this.sleep({ milliseconds: 1_000 });
         continue;
       }
 
       try {
-        // Give Turnstile some human pointer history before the click, then click
-        // the checkbox through our human-input engine (Bézier + dwell), via the
-        // pierced cross-origin-iframe element so the coordinates are translated.
         // Both steps can throw if the widget re-renders (Turnstile swaps its
         // iframe / checkbox node) — on a transient failure consume the attempt
         // and retry rather than rejecting the whole solve.
+        clicks += 1;
         await this.ambientActivity({ durationMs: 800, scroll: false });
+        // Widgets often sit in an animated / still-reflowing layout (nowsecure.nl
+        // slides its card in for ~10s): the click point is the checkbox's in-frame
+        // box plus the iframe's offset, so measuring it while the iframe moves
+        // lands the click beside the checkbox. Wait for the iframe to settle,
+        // re-find the checkbox for fresh coordinates, and treat a click during
+        // which the iframe moved as a miss (no point waiting out the attempt).
+        await this._wait_turnstile_settled(target.widget.backendNodeId, Math.min(8_000, remaining()));
+        const before = await this._turnstile_offset(target.widget.backendNodeId);
+        const checkbox = (await this._turnstile_checkbox(target.widget)) ?? target.checkbox;
         await checkbox.click();
+        const after = await this._turnstile_offset(target.widget.backendNodeId);
+        if (before && after && Math.hypot(after[0] - before[0], after[1] - before[1]) > 2) {
+          clicks -= 1;
+          continue;
+        }
       } catch {
         await this.sleep({ milliseconds: 1_000 });
         continue;
@@ -2107,6 +2169,7 @@ export class Tab {
       // Bound each attempt so a stuck widget frees the remaining attempts to
       // re-click instead of one attempt consuming the whole timeout.
       const attempt_deadline = Math.min(deadline, Date.now() + 10_000);
+      let gone_polls = 0;
       while (Date.now() < attempt_deadline) {
         await this.sleep({ milliseconds: 1_000 });
 
@@ -2115,14 +2178,155 @@ export class Tab {
           return { solved: true, token };
         }
 
-        const still_there = await this.find({ selector: "input[type='checkbox']", timeout: 1_000 });
-        if (!still_there) {
-          return { solved: true, token: await this.turnstileToken() };
+        const widget = await this._turnstile_widget(target.widget.backendNodeId, target.widget.targetId);
+        if (!widget) {
+          break; // the widget re-rendered (new iframe) — re-scan and retry
+        }
+        if (await this._turnstile_checkbox(widget)) {
+          gone_polls = 0;
+          continue;
+        }
+        if (widget.response) {
+          return { solved: true, token: real_turnstile_token(widget.response) };
+        }
+        gone_polls += 1;
+        if (!widget.hasResponseField && gone_polls >= 3) {
+          return { solved: true, token: null };
         }
       }
     }
 
     return { solved: false, token: await this.turnstileToken() };
+  }
+
+  // Lists the Turnstile widgets on the page: every OOP iframe whose owner <iframe>
+  // is a challenges.cloudflare.com frame or sits next to a cf-turnstile-response
+  // input, with the owner's layout and THAT widget's own response value. Only
+  // rendered widgets are returned, in-viewport ones first.
+  private async _turnstile_widgets(): Promise<TurnstileWidget[]> {
+    const widgets: TurnstileWidget[] = [];
+    try {
+      const targets_result = await this._cdp.send("Target.getTargets");
+      const iframe_targets = new Set(
+        (targets_result.targetInfos ?? [])
+          .filter((target: Record<string, any>) => target.type === "iframe")
+          .map((target: Record<string, any>) => String(target.targetId)),
+      );
+      const doc = await this._cdp.send("DOM.getDocument", { depth: -1, pierce: true });
+      for (const iframe of this._find_all_iframes(doc.root ?? {})) {
+        const frame_id = String(iframe.frameId ?? "");
+        const backend_id = Number(iframe.backendNodeId ?? 0);
+        if (!backend_id || !iframe_targets.has(frame_id)) {
+          continue;
+        }
+        const widget = await this._turnstile_widget(backend_id, frame_id);
+        if (widget) {
+          widgets.push(widget);
+        }
+      }
+    } catch (error) {
+      if (!(error instanceof CDPError)) {
+        throw error;
+      }
+    }
+    return widgets.sort((a, b) => Number(b.inViewport) - Number(a.inViewport));
+  }
+
+  // Reads one widget's owner-iframe state from the isolated world; null when the
+  // node is gone, is not a Turnstile frame, or is not rendered. The widget's own
+  // response input is found by walking up from the iframe — through its closed
+  // shadow root — to the nearest ancestor holding exactly one response input.
+  private async _turnstile_widget(backend_node_id: number, target_id: string): Promise<TurnstileWidget | null> {
+    try {
+      const context_id = await this._ensure_execution_context();
+      const resolved = await this._cdp.send("DOM.resolveNode", { backendNodeId: backend_node_id, executionContextId: context_id });
+      const object_id = resolved.object?.objectId;
+      if (!object_id) {
+        return null;
+      }
+      const result = await this._cdp.send("Runtime.callFunctionOn", {
+        objectId: object_id,
+        returnByValue: true,
+        functionDeclaration: `
+          function() {
+            const FIELD = "input[name='cf-turnstile-response'], textarea[name='cf-turnstile-response']";
+            let field = null;
+            for (let node = this; node && !field; ) {
+              const parent = node.parentNode || node.host || null;
+              if (parent && parent.querySelectorAll) {
+                const found = parent.querySelectorAll(FIELD);
+                if (found.length > 1) break;
+                if (found.length === 1) field = found[0];
+              }
+              node = parent;
+            }
+            const turnstile = !!field || String(this.src || '').includes('challenges.cloudflare.com');
+            const rect = this.getBoundingClientRect();
+            const rendered = rect.width > 0 && rect.height > 0 && (!this.checkVisibility || this.checkVisibility({ visibilityProperty: true }));
+            const in_viewport = rendered && rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth;
+            return { turnstile, rendered, in_viewport, has_field: !!field, response: field && field.value ? String(field.value) : '' };
+          }
+        `,
+      });
+      const value = result.result?.value as
+        | { turnstile: boolean; rendered: boolean; in_viewport: boolean; has_field: boolean; response: string }
+        | undefined;
+      if (!value || !value.turnstile || !value.rendered) {
+        return null;
+      }
+      return {
+        targetId: target_id,
+        backendNodeId: backend_node_id,
+        inViewport: value.in_viewport,
+        hasResponseField: value.has_field,
+        response: value.response.trim() || null,
+      };
+    } catch (error) {
+      if (!(error instanceof CDPError)) {
+        throw error;
+      }
+      this._invalidate_execution_context();
+      return null;
+    }
+  }
+
+  // Top-left of a widget's owner <iframe> in the viewport, or null when unrendered.
+  private async _turnstile_offset(backend_node_id: number): Promise<[number, number] | null> {
+    try {
+      const result = await this._cdp.send("DOM.getContentQuads", { backendNodeId: backend_node_id });
+      const quad = result.quads?.[0];
+      return quad && quad.length >= 2 ? [quad[0], quad[1]] : null;
+    } catch (error) {
+      if (!(error instanceof CDPError)) {
+        throw error;
+      }
+      return null;
+    }
+  }
+
+  // Waits (up to budgetMs) until the widget's iframe holds still: three samples
+  // 200ms apart within 1px of each other.
+  private async _wait_turnstile_settled(backend_node_id: number, budget_ms: number): Promise<void> {
+    const until = Date.now() + budget_ms;
+    let last = await this._turnstile_offset(backend_node_id);
+    let still = 0;
+    while (still < 2 && Date.now() < until) {
+      await delay(200);
+      const now = await this._turnstile_offset(backend_node_id);
+      const moved = !last || !now || Math.abs(now[0] - last[0]) > 1 || Math.abs(now[1] - last[1]) > 1;
+      still = moved ? 0 : still + 1;
+      last = now;
+    }
+  }
+
+  // The widget's checkbox when it is actually displayed (Turnstile keeps the node
+  // around, hidden, while verifying and after success), else null.
+  private async _turnstile_checkbox(widget: TurnstileWidget): Promise<Element | null> {
+    const checkbox = await this._search_in_oop_iframe(widget.targetId, "input[type='checkbox']");
+    if (!checkbox) {
+      return null;
+    }
+    return (await checkbox.isVisible().catch(() => false)) ? checkbox : null;
   }
 
   async setExtraHeaders({ headers }: { headers: Record<string, string> }): Promise<void> {
@@ -2389,6 +2593,16 @@ function build_webgl_override_source(vendor: string, renderer: string): string {
 // a UA recovered via Browser.getVersion is indistinguishable from a headful one.
 function strip_headless(user_agent: string): string {
   return user_agent.replace(/HeadlessChrome/g, "Chrome");
+}
+
+// A usable Turnstile token, or null for an empty / placeholder value — including
+// the "XXXX.DUMMY.TOKEN.XXXX" that Cloudflare's test sitekeys mint on success.
+function real_turnstile_token(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.length <= 30 || trimmed.toUpperCase().includes("DUMMY")) {
+    return null;
+  }
+  return trimmed;
 }
 
 function normalize_ref(ref: string): string {

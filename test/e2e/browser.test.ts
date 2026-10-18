@@ -77,6 +77,27 @@ describe("browser (e2e)", { skip: chrome ? false : "Chrome not found" }, () => {
     assert.ok(interactive.split("\n").every((line) => line.startsWith("- ")));
   });
 
+  test("solveTurnstile clicks the visible widget, not its off-screen duplicate, and sees the test-key success", async () => {
+    const widget_tab = await browser.newTab();
+    try {
+      await widget_tab.goto({ url: `${server.origin}/turnstile` });
+      await widget_tab.waitForFunction({ expression: "!!document.body.dataset.frameUa" });
+
+      // The UA override must reach the OOP iframe too (no "HeadlessChrome").
+      const frame_ua = await widget_tab.evaluate({ expression: "document.body.dataset.frameUa" });
+      assert.doesNotMatch(String(frame_ua), /Headless/);
+
+      const result = await widget_tab.solveTurnstile({ timeoutMs: 20_000 });
+      assert.deepEqual(result, { solved: true, token: null });
+      const values = await widget_tab.evaluate({
+        expression: "JSON.stringify(['w0', 'w1'].map((id) => document.querySelector('#' + id + ' input').value))",
+      });
+      assert.deepEqual(JSON.parse(String(values)), ["", "XXXX.DUMMY.TOKEN.XXXX"]);
+    } finally {
+      await browser.closeTab(widget_tab);
+    }
+  });
+
   test("scrape escalates http → browser and refuses challenge pages", async () => {
     const article = await scrape({ url: `${server.origin}/article`, browser });
     assert.equal(article.tier, "http");

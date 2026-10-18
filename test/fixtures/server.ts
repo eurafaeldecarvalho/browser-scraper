@@ -47,6 +47,36 @@ const PAGES: Record<string, (cross: string) => string> = {
 </body>
 </html>`,
   "/frame": () => `<!doctype html><html><body><h4>Cross-origin frame</h4><p>Content from another site.</p><button onclick="this.textContent='frame-clicked'">Frame button</button></body></html>`,
+  // Turnstile look-alike: two widgets (a responsive duplicate parked off-screen
+  // FIRST in DOM order, then the visible one), each a closed-shadow container
+  // holding a cross-origin iframe plus a light-DOM response input — like
+  // nowsecure.nl. A click mints the test-sitekey "XXXX.DUMMY.TOKEN.XXXX".
+  "/turnstile": (cross) => `<!doctype html><html><head><title>Turnstile fixture</title></head><body>
+    <div class="cf-turnstile" id="w0" style="position:absolute;top:-200px;left:0"><input type="hidden" name="cf-turnstile-response"></div>
+    <h1>Turnstile fixture</h1>
+    <div class="cf-turnstile" id="w1"><input type="hidden" name="cf-turnstile-response"></div>
+    <script>
+      for (const id of ["w0", "w1"]) {
+        const root = document.getElementById(id).attachShadow({ mode: "closed" });
+        root.innerHTML = '<iframe src="${cross}/turnstile-frame?w=' + id + '" width="300" height="65" style="border:0"></iframe>';
+      }
+      addEventListener("message", (e) => {
+        if (e.data && e.data.ua) document.body.dataset.frameUa = e.data.ua;
+        if (e.data && e.data.widget) document.querySelector("#" + e.data.widget + " input").value = e.data.token;
+      });
+    </script>
+  </body></html>`,
+  "/turnstile-frame": () => `<!doctype html><html><body><div id="host"></div><script>
+    const w = new URLSearchParams(location.search).get("w");
+    const root = document.getElementById("host").attachShadow({ mode: "closed" });
+    root.innerHTML = '<label><input type="checkbox"> Verify you are human</label><span hidden>Success!</span>';
+    root.querySelector("input").addEventListener("click", () => {
+      root.querySelector("label").hidden = true;
+      root.querySelector("span").hidden = false;
+      parent.postMessage({ widget: w, token: "XXXX.DUMMY.TOKEN.XXXX" }, "*");
+    });
+    parent.postMessage({ ua: navigator.userAgent }, "*");
+  </script></body></html>`,
   "/blocked": () => `<!doctype html><html><head><title>Just a moment...</title></head><body><div id="challenge-running">Checking your browser</div><script>window._cf_chl_opt={}</script></body></html>`,
   "/spa": () => `<!doctype html><html><head><title>SPA</title></head><body><div id="root"></div><noscript>You need to enable JavaScript to run this app.</noscript><script>document.getElementById('root').innerHTML='<main><h1>Rendered by JS</h1><p>' + 'This content only exists after JavaScript runs. '.repeat(5) + '</p></main>'</script></body></html>`,
   "/products": () => `<!doctype html><html><head><title>Products</title></head><body><main><h1>Products</h1>
