@@ -106,7 +106,7 @@ export class CDPClient {
     await new Promise<void>((resolve) => {
       ws.once("close", () => resolve());
       ws.close();
-      void delay(5_000).then(() => resolve());
+      void delay(5_000, undefined, { ref: false }).then(() => resolve());
     });
 
     this._reject_pending(new CDPError(-1, "CDP connection closed"));

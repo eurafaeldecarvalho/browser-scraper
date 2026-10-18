@@ -9,6 +9,10 @@ import { buildUserAgentMetadata, defaultWebglForPlatform, platformFromUA, type G
 import { CDPClient, CDPError } from "./cdp-client";
 import { Element } from "./element";
 import { Network } from "./network";
+import { treeToMarkdown, type MarkdownOptions, type MarkdownResult } from "../content/markdown";
+import { treeMetadata, type PageMetadata } from "../content/metadata";
+import { renderSnapshot, type AXFrame, type SnapshotOptions, type SnapshotRef } from "../content/snapshot";
+import { findFirst, fromCdpNode, textOf, type ContentElement } from "../content/tree";
 
 export type WaitUntil = "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
 export type WaitForSelectorState = "attached" | "visible" | "hidden" | "ready";
@@ -61,6 +65,7 @@ export class Tab {
   // per-tab name removes the constant at no cost.
   private readonly _world_name = `u${randomBytes(8).toString("hex")}`;
   private _oop_frame_sessions = new Map<string, string>();
+  private _snapshot_refs = new Map<string, SnapshotRef>();
   private _network: Network | null = null;
   private _proxy_auth: [string, string] | null;
   private _user_agent: string | null;
@@ -666,14 +671,18 @@ export class Tab {
       this._cdp.on("Page.lifecycleEvent", event_handler);
     }
 
+    // The timeout timer is cancelled once navigation settles; a dangling 30s
+    // timer would otherwise keep the Node process alive after the work is done.
+    const timer = new AbortController();
     try {
       await Promise.race([
         navigation_event,
-        delay(timeout).then(() => {
+        delay(timeout, undefined, { signal: timer.signal }).then(() => {
           throw new Error(`Timeout waiting for navigation: ${normalized_wait_until}`);
         }),
       ]);
     } finally {
+      timer.abort();
       if (event_handler) {
         this._cdp.off("Page.lifecycleEvent", event_handler);
       }
@@ -1152,6 +1161,7 @@ export class Tab {
   private async _get_iframe_offset_for_target(_target_id: string): Promise<[number, number]> {
     try {
       const doc = await this._cdp.send("DOM.getDocument", { depth: -1, pierce: true });
+      let matching: number | null = null;
 
       const find_iframes = (node: Record<string, any>): number[] => {
         const results: number[] = [];
@@ -1160,6 +1170,11 @@ export class Tab {
           const backend_id = Number(node.backendNodeId ?? 0);
           if (backend_id) {
             results.push(backend_id);
+          }
+          // The iframe hosting THIS target (an OOPIF's frameId is its targetId)
+          // is remembered so its offset wins over unrelated iframes.
+          if (backend_id && String(node.frameId ?? "") === _target_id) {
+            matching = backend_id;
           }
         }
 
@@ -1174,7 +1189,9 @@ export class Tab {
         return results;
       };
 
-      for (const backend_id of find_iframes(doc.root ?? {})) {
+      const all_iframes = find_iframes(doc.root ?? {});
+      const ordered = matching ? [matching, ...all_iframes.filter((id) => id !== matching)] : all_iframes;
+      for (const backend_id of ordered) {
         try {
           const quads = await this._cdp.send("DOM.getContentQuads", {
             backendNodeId: backend_id,
@@ -1662,6 +1679,173 @@ export class Tab {
     }
 
     return results;
+  }
+
+  // ---------------------------------------------------------------------------
+  // AI-ready content: markdown, metadata, accessibility snapshot + refs.
+  // All of it reads CDP trees (DOM.getDocument pierce / Accessibility) — no JS
+  // is injected into the page — and therefore includes CLOSED shadow roots and,
+  // opt-in, cross-origin (OOP) iframes.
+  // ---------------------------------------------------------------------------
+
+  // The current document URL (no page JS).
+  async url(): Promise<string> {
+    const doc = await this._cdp.send("DOM.getDocument", { depth: 0 });
+    return String(doc.root?.documentURL ?? this.target_info.url ?? "");
+  }
+
+  async title(): Promise<string> {
+    const doc = await this._cdp.send("DOM.getDocument", { depth: -1, pierce: false });
+    const root = fromCdpNode(doc.root ?? {}, { iframes: false });
+    const title = findFirst(root, (el) => el.tag === "title");
+    return title ? textOf(title).trim() : "";
+  }
+
+  private async _content_tree({ includeIframes }: { includeIframes: boolean }): Promise<{ root: ContentElement; url: string }> {
+    const doc = await this._cdp.send("DOM.getDocument", { depth: -1, pierce: true });
+    const frames = new Map<string, Record<string, any>>();
+
+    if (includeIframes) {
+      for (const [target_id, session_id] of [...this._oop_frame_sessions]) {
+        try {
+          const frame_doc = await this._cdp.send("DOM.getDocument", { depth: -1, pierce: true }, session_id);
+          if (frame_doc.root) {
+            frames.set(target_id, frame_doc.root);
+          }
+        } catch (error) {
+          if (!(error instanceof CDPError)) {
+            throw error;
+          }
+          // The frame navigated away / detached since it attached.
+          this._oop_frame_sessions.delete(target_id);
+        }
+      }
+    }
+
+    const url = String(doc.root?.documentURL ?? this.target_info.url ?? "");
+    return { root: fromCdpNode(doc.root ?? {}, { frames, iframes: includeIframes }), url };
+  }
+
+  // Clean, LLM-ready Markdown of the page. By default only the main content is
+  // kept (navigation, headers, footers, cookie banners dropped — a heuristic, set
+  // mainContent:false for everything). Content inside closed shadow roots is
+  // included; set includeIframes:true to also inline iframe documents, including
+  // cross-origin ones. `query` keeps only the blocks relevant to it (BM25).
+  async markdown(options: MarkdownOptions & { includeIframes?: boolean } = {}): Promise<MarkdownResult & { url: string }> {
+    const { includeIframes = false, ...rest } = options;
+    const { root, url } = await this._content_tree({ includeIframes });
+    return { url, ...treeToMarkdown(root, { baseUrl: url, ...rest }) };
+  }
+
+  // Structured page metadata: title, description, canonical, lang, OpenGraph,
+  // Twitter card and every JSON-LD (schema.org) block.
+  async metadata(): Promise<PageMetadata> {
+    const { root, url } = await this._content_tree({ includeIframes: false });
+    return treeMetadata(root, url);
+  }
+
+  // Accessibility-tree outline of the page with refs on interactive elements,
+  // the format LLM agents act on ("- button \"Continue\" [ref=e5]"). The tree is
+  // computed on the composed tree, so elements inside CLOSED shadow roots are
+  // listed; iframes — including cross-origin ones — are spliced under their
+  // <iframe>. Resolve a ref to a real Element (human-like click/type) with
+  // byRef(). Refs are valid until the next snapshot() call.
+  async snapshot(options: SnapshotOptions & { includeIframes?: boolean } = {}): Promise<string> {
+    const frames: AXFrame[] = [];
+    const main = await this._cdp.send("Accessibility.getFullAXTree", {});
+    frames.push({ sessionId: null, targetId: null, nodes: main.nodes ?? [], hostBackendNodeId: null });
+
+    if (options.includeIframes ?? true) {
+      const frame_owner = async (frame_id: string): Promise<number | null> => {
+        try {
+          const owner = await this._cdp.send("DOM.getFrameOwner", { frameId: frame_id });
+          return Number(owner.backendNodeId ?? 0) || null;
+        } catch {
+          return null;
+        }
+      };
+
+      // Same-process child frames live in this session, addressed by frameId.
+      try {
+        const tree = await this._cdp.send("Page.getFrameTree");
+        const stack: Array<Record<string, any>> = [...(tree.frameTree?.childFrames ?? [])];
+        while (stack.length > 0) {
+          const entry = stack.shift() ?? {};
+          stack.push(...(entry.childFrames ?? []));
+          const frame_id = String(entry.frame?.id ?? "");
+          if (!frame_id || this._oop_frame_sessions.has(frame_id)) {
+            continue;
+          }
+          try {
+            const result = await this._cdp.send("Accessibility.getFullAXTree", { frameId: frame_id });
+            frames.push({
+              sessionId: null,
+              targetId: null,
+              nodes: result.nodes ?? [],
+              hostBackendNodeId: await frame_owner(frame_id),
+              url: String(entry.frame?.url ?? ""),
+            });
+          } catch (error) {
+            if (!(error instanceof CDPError)) {
+              throw error;
+            }
+          }
+        }
+      } catch (error) {
+        if (!(error instanceof CDPError)) {
+          throw error;
+        }
+      }
+
+      // Out-of-process iframes: their own sessions.
+      for (const [target_id, session_id] of [...this._oop_frame_sessions]) {
+        try {
+          const result = await this._cdp.send("Accessibility.getFullAXTree", {}, session_id);
+          frames.push({
+            sessionId: session_id,
+            targetId: target_id,
+            nodes: result.nodes ?? [],
+            hostBackendNodeId: await frame_owner(target_id),
+          });
+        } catch (error) {
+          if (!(error instanceof CDPError)) {
+            throw error;
+          }
+          this._oop_frame_sessions.delete(target_id);
+        }
+      }
+    }
+
+    const { text, refs } = renderSnapshot(frames, options);
+    this._snapshot_refs = refs;
+    return text;
+  }
+
+  // Resolves a ref from the last snapshot() ("e5", "ref=e5" or "[ref=e5]") to an
+  // Element — click()/type() keep the human-like input engine.
+  async byRef({ ref }: { ref: string }): Promise<Element> {
+    const key = normalize_ref(ref);
+    const entry = this._snapshot_refs.get(key);
+    if (!entry) {
+      throw new Error(`Unknown ref "${ref}". Refs come from the latest tab.snapshot() — take a fresh snapshot and retry.`);
+    }
+
+    await this._cdp.send("DOM.getDocument", { depth: 0 }, entry.sessionId);
+    const pushed = await this._cdp.send("DOM.pushNodesByBackendIdsToFrontend", { backendNodeIds: [entry.backendNodeId] }, entry.sessionId);
+    const node_id = Number(pushed.nodeIds?.[0] ?? 0);
+    if (!node_id) {
+      throw new Error(`Element for ref "${key}" is gone (the page changed). Take a fresh snapshot().`);
+    }
+
+    const offset = entry.targetId ? await this._get_iframe_offset_for_target(entry.targetId) : null;
+    return new Element(this._cdp, node_id, `ref=${key}`, entry.sessionId, offset);
+  }
+
+  // Role + accessible name of a ref from the latest snapshot, e.g. for logging
+  // what an agent is about to click.
+  describeRef({ ref }: { ref: string }): { role: string; name: string } | null {
+    const entry = this._snapshot_refs.get(normalize_ref(ref));
+    return entry ? { role: entry.role, name: entry.name } : null;
   }
 
   async screenshot({
@@ -2205,4 +2389,8 @@ function build_webgl_override_source(vendor: string, renderer: string): string {
 // a UA recovered via Browser.getVersion is indistinguishable from a headful one.
 function strip_headless(user_agent: string): string {
   return user_agent.replace(/HeadlessChrome/g, "Chrome");
+}
+
+function normalize_ref(ref: string): string {
+  return ref.replace(/^\[?(ref=)?/, "").replace(/\]$/, "").trim();
 }

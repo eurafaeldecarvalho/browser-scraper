@@ -1,22 +1,35 @@
-# Browser Scraper — Undetected CDP Browser Automation & Stealth Web Scraping for Node.js
+# Browser Scraper: the stealth browser for web scraping and AI agents
 
-**Stealth web scraping and undetected browser automation for Node.js — a CDP-first Puppeteer / Playwright alternative that drives real Chrome without tripping the automation tells that get headless browsers blocked. Bypass Cloudflare Turnstile, pierce closed Shadow DOM, keep one coherent fingerprint. TypeScript-native.**
+**Undetected Chrome for Node.js that reads and operates the sites that block bots. Use it as a library, a CLI or an MCP server for Claude, Cursor and Codex. It turns any page, including closed Shadow DOM and cross-origin iframes, into clean Markdown, structured data or an accessibility snapshot an agent can click through. Local, free, MIT, bring-your-own-LLM.**
 
 [![npm version](https://img.shields.io/npm/v/@eurafaeldecarvalho/browser-scraper.svg)](https://www.npmjs.com/package/@eurafaeldecarvalho/browser-scraper)
+[![CI](https://github.com/eurafaeldecarvalho/browser-scraper/actions/workflows/ci.yml/badge.svg)](https://github.com/eurafaeldecarvalho/browser-scraper/actions/workflows/ci.yml)
 [![npm downloads](https://img.shields.io/npm/dm/@eurafaeldecarvalho/browser-scraper.svg)](https://www.npmjs.com/package/@eurafaeldecarvalho/browser-scraper)
 [![node](https://img.shields.io/node/v/@eurafaeldecarvalho/browser-scraper.svg)](https://nodejs.org)
-[![license](https://img.shields.io/npm/l/@eurafaeldecarvalho/browser-scraper.svg)](./LICENSE)
-[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/eurafaeldecarvalho)
-[![Ko-fi](https://img.shields.io/badge/Ko--fi-Buy%20me%20a%20coffee-ff5e5b?logo=ko-fi&logoColor=white)](https://ko-fi.com/eurafaeldecarvalho)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-`@eurafaeldecarvalho/browser-scraper` is a stealth, undetected browser-automation library for **web scraping** the sites that block bots — Cloudflare Turnstile, reCAPTCHA v3, DataDome — built as a CDP-first **Puppeteer / Playwright alternative**. It drives Chrome directly over the DevTools Protocol (CDP) and is built around *not* sending `Runtime.enable` — that call alone is one of the most widely fingerprinted bot signals — while keeping every layer of the browser's identity telling the same story.
+```ts
+import { scrape } from "@eurafaeldecarvalho/browser-scraper";
 
-What you get over a stock Puppeteer/Playwright setup:
+const page = await scrape({ url: "https://example.com", formats: ["markdown", "metadata"] });
+console.log(page.tier);     // "http" | "browser" | "stealth": the cheapest tier that worked
+console.log(page.markdown); // clean, LLM-ready Markdown of the main content
+```
 
-- **No `Runtime.enable` leak.** JavaScript runs through `Page.createIsolatedWorld` + `Runtime.evaluate` — plain commands that never enable the Runtime domain, so the Runtime-domain-dependent signals (`Runtime.consoleAPICalled` and friends) never fire.
-- **One `find()` that pierces everything.** Closed shadow roots and cross-origin (OOP) iframes are searched automatically in a single call. No manual frame handling, no `shadowRoot` walking.
-- **A fingerprint that doesn't contradict itself.** User-Agent, Client Hints, WebGL, timezone, and locale are all derived from one resolved UA, so the layers can't disagree — and a cross-layer mismatch is the highest-signal tell there is.
-- **Human input by default.** Mouse paths follow a min-jerk velocity profile with tremor and overshoot; typing uses lognormal dwell/flight timing. You don't opt in — it's how `click()` and `type()` already behave.
+```bash
+# Give Claude Code a browser that gets through Cloudflare:
+claude mcp add browser-scraper -- npx -y @eurafaeldecarvalho/browser-scraper mcp
+```
+
+`@eurafaeldecarvalho/browser-scraper` drives real Chrome over the raw DevTools Protocol (CDP). It never sends `Runtime.enable`, one of the most widely fingerprinted automation signals, and every layer of the browser's identity tells the same story. On top of that stealth core it adds the pieces AI workloads need: Markdown and metadata extraction, an accessibility snapshot with clickable refs, a one-call `scrape()` that escalates from plain HTTP to a stealth browser only when it has to, an MCP server, and optional LLM extraction with any model.
+
+**Why this one:**
+
+- **Gets through where headless browsers get blocked.** There is no `Runtime.enable` leak, the persona (UA, Client Hints, WebGL, timezone, locale) is coherent, and mouse and keyboard input are human-like. `solveTurnstile()` handles Cloudflare's checkbox.
+- **Sees everything.** `find()`, `markdown()` and `snapshot()` all reach into **closed** shadow roots and **cross-origin iframes**, which Playwright's snapshot and Readability-style extractors miss.
+- **Built for agents.** The MCP server and CLI work with no extra install. Credentials are typed through `{{SECRET}}` placeholders so the model never sees them, an allow-list restricts domains, and page content is fenced as untrusted data.
+- **LLM only where it pays.** `generateExtractor()` has the model write CSS selectors **once**. After that `run()` extracts with no LLM, and `runOrHeal()` regenerates the selectors when the site changes.
+- **Local and free.** No cloud, no API key, no per-page billing. You bring the proxy and, optionally, the model (OpenAI, Anthropic, Google, Ollama… through the Vercel AI SDK, or your own function).
 
 ## Passes the bot detectors people actually use
 
@@ -45,6 +58,7 @@ This is a precision tool, not a magic bypass — it's honest about its edges (se
 
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [For AI agents & LLMs](#for-ai-agents--llms) — Markdown, `scrape()`, snapshot + refs, MCP server, CLI, LLM extraction
 - [The tour](#the-tour) — what it does, by example
   - [Pierce closed Shadow DOM + cross-origin iframes](#pierce-closed-shadow-dom-and-cross-origin-iframes-with-one-find)
   - [Wait for the right moment](#wait-for-the-right-moment)
@@ -78,11 +92,7 @@ or:
 pnpm add @eurafaeldecarvalho/browser-scraper
 ```
 
-If `pnpm` blocks native build scripts, run:
-
-```bash
-pnpm rebuild better-sqlite3 esbuild
-```
+Requires Node.js ≥ 20 and Chrome/Chromium. Profile history seeding uses Node's built-in `node:sqlite` (Node ≥ 22.5) or the optional `better-sqlite3`; if neither is available it is simply skipped. The LLM helpers need `ai` (and `zod` if you use Zod schemas), and only if you import `/ai`.
 
 Requires Node.js ≥ 20 and a local Chrome/Chromium (it's found automatically, or point at one with `chromePath`). For AWS Lambda, also install the optional `@sparticuz/chromium` — see [Cloud deployment](#cloud-deployment-lambda-vs-ec2-gpu).
 
@@ -107,6 +117,157 @@ try {
 ```
 
 That's the whole shape of the library: a `Browser`, a `Tab`, and `Element`s you find and act on. Everything below is detail on top of these three.
+
+---
+
+## For AI agents & LLMs
+
+### Clean Markdown, metadata and links
+
+```ts
+const tab = await browser.newTab();
+await tab.goto({ url: "https://shop.example.com/product/42" });
+
+const { markdown, title, links, wordCount } = await tab.markdown({
+  mainContent: true,      // drop nav/header/footer/cookie banners (default)
+  query: "price shipping", // optional: keep only the relevant blocks (BM25), saves tokens
+  links: "inline",        // "inline" | "reference" | "none"
+  includeIframes: false,  // true = also inline iframe documents, cross-origin included
+});
+
+const meta = await tab.metadata();
+// { title, description, canonical, lang, image, openGraph, twitter, jsonLd: [...] }
+// JSON-LD often already has the price, rating and availability: check it before you prompt.
+```
+
+`markdown()` reads Chrome's own DOM tree over CDP (`DOM.getDocument` with `pierce`). **No script is injected into the page**, and the content of **closed shadow roots** is included in reading order, with slots composed. For HTML you already have, `htmlToMarkdown(html)` and `extractMetadata(html)` do the same without a browser.
+
+### `scrape()`: one call, cheapest tier first
+
+```ts
+import { Browser, scrape } from "@eurafaeldecarvalho/browser-scraper";
+
+const browser = new Browser({ proxy: process.env.PROXY });   // reuse it across URLs
+const page = await scrape({
+  url,
+  browser,
+  formats: ["markdown", "metadata", "links", "html", "screenshot"],
+  strategy: "auto",   // http → browser → stealth (or pin one tier)
+  http: { curlImpersonate: "curl_chrome131" }, // optional: real Chrome TLS for the http tier
+});
+
+page.tier;      // which tier produced the result
+page.attempts;  // [{ tier: "http", ok: false, reason: "needs JavaScript (empty app shell)", ms: 4 }, …]
+```
+
+| Tier | What runs | Used when |
+|---|---|---|
+| `http` | One request, no Chrome (Node fetch, or curl-impersonate for a genuine Chrome JA3/JA4) | Static pages, APIs |
+| `browser` | The stealth Chrome | The HTTP response was blocked (403/429/503), a challenge, or an empty JS app shell |
+| `stealth` | The same tab plus a behavioral warm-up and an interactive Turnstile solve | The browser still sees a challenge page |
+
+A challenge page is **never** returned as content: if every tier is blocked, `scrape()` throws a `ScrapeError` that carries the `attempts`.
+
+### Accessibility snapshot + refs (what agents click on)
+
+```ts
+console.log(await tab.snapshot());
+// - main
+//   - heading "Sign in" [level=1]
+//   - textbox "Email" [ref=e3]
+//   - button "Continue" [ref=e4]
+//   - Iframe [ref=e5]
+//     - checkbox "Verify you are human" [ref=e6]   ← cross-origin iframe, still addressable
+
+await (await tab.byRef({ ref: "e3" })).type({ text: "me@example.com" }); // human-like typing
+await (await tab.byRef({ ref: "e4" })).click();                          // human-like mouse
+```
+
+The accessibility tree is computed on the composed tree, so elements inside **closed** shadow roots appear and can be clicked. Pass `{ interactive: true }` to get just the flat list of clickable or typeable elements.
+
+### MCP server (Claude Code, Claude Desktop, Cursor, Codex…)
+
+```bash
+claude mcp add browser-scraper -- npx -y @eurafaeldecarvalho/browser-scraper mcp
+```
+
+Or in any MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, …):
+
+```json
+{
+  "mcpServers": {
+    "browser-scraper": {
+      "command": "npx",
+      "args": ["-y", "@eurafaeldecarvalho/browser-scraper", "mcp", "--allowed-domains", "example.com", "--secrets", "/path/to/.env"]
+    }
+  }
+}
+```
+
+**Tools:**
+
+| Tool | What it does |
+|---|---|
+| `navigate` | Opens a URL and returns the snapshot |
+| `snapshot` | Accessibility outline with `[ref=…]` |
+| `click` | Clicks an element by ref, with human-like input |
+| `type` | Types into an element by ref, with human-like input |
+| `press_key` | Presses a key |
+| `go_back` | Goes back in history |
+| `wait` | Waits a number of seconds |
+| `markdown` | Main content as Markdown, with an optional `query` |
+| `metadata` | JSON-LD, OpenGraph and the rest of the page metadata |
+| `screenshot` | PNG screenshot |
+| `solve_turnstile` | Solves an interactive Cloudflare Turnstile |
+| `scrape` | One-shot fetch with tier escalation |
+| `check_egress` | Shows whether your exit IP looks like a datacenter |
+
+**Guard rails:**
+
+- `--allowed-domains a.com,b.com` refuses navigation elsewhere, and rolls back clicks that leave the list.
+- `--secrets .env` lets the agent type `{{PASSWORD}}`. The value is filled in at keystroke time and redacted from everything returned.
+- Page content always comes back inside `<untrusted-page-content>` markers.
+- Other options: `--proxy`, `--headful`, `--user-data-dir`, `--geo BR`. The server is also listed for the MCP Registry (`server.json`), and an [Agent Skill](./skills/browser-scraper/SKILL.md) is included.
+
+### CLI
+
+```bash
+npx @eurafaeldecarvalho/browser-scraper markdown https://example.com --query pricing
+npx @eurafaeldecarvalho/browser-scraper scrape https://example.com --format markdown,metadata,links --json
+npx @eurafaeldecarvalho/browser-scraper snapshot https://example.com --interactive
+npx @eurafaeldecarvalho/browser-scraper scrape https://example.com --format screenshot --out page.png
+```
+
+### LLM extraction: `@eurafaeldecarvalho/browser-scraper/ai`
+
+Optional, and nothing extra is installed unless you use it. Pass a [Vercel AI SDK](https://ai-sdk.dev) model (`npm i ai @ai-sdk/anthropic`, or openai, google, ollama…) **or** your own `llm` function. Schemas can be Zod or plain JSON Schema.
+
+```ts
+import { extract, generateExtractor, Extractor, observe } from "@eurafaeldecarvalho/browser-scraper/ai";
+import { anthropic } from "@ai-sdk/anthropic";
+import { z } from "zod";
+
+const Product = z.object({ name: z.string(), price: z.number(), inStock: z.boolean() });
+const model = anthropic("claude-sonnet-5-5");
+
+// 1) One LLM call per page.
+const product = await extract({ tab, schema: Product, model });
+//    input: "markdown" (default) | "snapshot" | "image" (screenshot for vision models)
+
+// 2) The LLM writes the selectors ONCE; later pages cost nothing.
+const extractor = await generateExtractor({ tab, schema: z.array(Product), model });
+await extractor.save({ path: ".extractors/products.json" });
+
+const again = await Extractor.load({ path: ".extractors/products.json", schema: z.array(Product), model });
+const items = await again.run({ tab });                 // no LLM, runs in the isolated world
+const { data, via } = await again.runOrHeal({ tab });   // via: "selectors" | "healed" | "llm"
+
+// 3) Find elements by description: the model only LOCATES, your code acts.
+const [login] = await observe({ tab, model, instruction: "the login button" });
+await login.element.click();
+```
+
+No model handy? `llm: async ({ system, prompt, schema, images }) => myClient.json(...)` works with any provider or a local model.
 
 ---
 
@@ -317,6 +478,14 @@ await tab.evaluate({ expression: "window.__APP_STATE__", world: "main" });
 await tab.screenshot({ path: "shot.png" });
 await tab.content();
 await tab.sleep({ milliseconds: 2_000 });
+// AI-ready content (no page JS; closed shadow DOM included)
+await tab.markdown({ mainContent: true, query: "pricing", links: "inline", includeIframes: false });
+await tab.metadata();            // OpenGraph, Twitter, canonical, JSON-LD
+await tab.snapshot({ interactive: false }); // accessibility outline with [ref=eN]
+await tab.byRef({ ref: "e4" });  // → Element (human-like click/type)
+await tab.url();
+await tab.title();
+await browser.closeTab(tab);     // closes the page target (tab.close() only disconnects)
 
 // History navigation
 await tab.back();
@@ -589,6 +758,20 @@ If you're shopping for an **undetected Puppeteer / Playwright alternative**, her
 
 This is a precision tool, not a magic captcha bypass: against hard targets (Cloudflare, DataDome, Kasada) your **IP reputation** still dominates — pair it with a residential/mobile proxy (see [Cloud deployment](#cloud-deployment-lambda-vs-ec2-gpu)).
 
+### For AI agents
+
+| | `@playwright/mcp` | Stagehand | Firecrawl / hosted scrapers | **browser-scraper** |
+| --- | :---: | :---: | :---: | :---: |
+| Runs locally, no API key | ✓ | ✓ (BYO model) | ✗ (paid API) / self-host | **✓** |
+| Stealth (no `Runtime.enable`, coherent persona, human input) | ✗ | via Browserbase cloud | server-side | **✓ built-in** |
+| Cloudflare Turnstile solve | ✗ | cloud only | ✓ (paid) | **✓ `solveTurnstile()`** |
+| Snapshot reaches **closed** shadow roots | ✗ | ✗ | n/a | **✓** |
+| HTML → Markdown, metadata | ✗ | partial | ✓ | **✓** |
+| Selectors generated once, then no LLM | ✗ | action cache | ✗ | **✓ `generateExtractor()`** |
+| Cost per page | free | LLM per action | per credit | **free (LLM optional)** |
+
+Use Stagehand or browser-use if you want an autonomous agent loop. Use browser-scraper as the **browser layer** under an agent (Claude, Cursor, your own), or when you mostly need content out of protected pages cheaply.
+
 ## FAQ
 
 ### How do I make Puppeteer undetected / pass bot detection in Node.js?
@@ -609,12 +792,19 @@ Use the optional `@sparticuz/chromium` build and `resolveSparticuz()`; the libra
 ### Puppeteer vs Playwright for stealth scraping — which should I use?
 Both are high-level drivers that enable the `Runtime` domain and can't pierce closed shadow roots, so for detection-sensitive scraping you end up bolting on stealth plugins. This library is the CDP-first alternative built for that case from the start — see [Alternatives](#alternatives--how-it-compares).
 
+### How do I give Claude / Cursor a browser that isn't blocked?
+Run the bundled MCP server: `claude mcp add browser-scraper -- npx -y @eurafaeldecarvalho/browser-scraper mcp`. The agent gets `navigate` / `snapshot` / `click` / `type` / `markdown` / `solve_turnstile` on a stealth Chrome. See [MCP server](#mcp-server-claude-code-claude-desktop-cursor-codex).
+
+### How do I scrape a website into Markdown for an LLM / RAG pipeline?
+`scrape({ url, formats: ["markdown"] })` returns clean main-content Markdown, escalating from plain HTTP to the stealth browser only when needed. For structured fields, use `extract()` with a Zod schema, or `generateExtractor()` to pay the LLM once per site layout instead of once per page.
+
 ### Does it solve CAPTCHAs or reCAPTCHA v3?
 It does not solve image/token CAPTCHAs. What it does is keep your reCAPTCHA **v3 score** high — human-like mouse/typing, ambient activity before a token-minting call, and a warmed persistent profile on a sticky residential IP — see [Identity & persistence](#identity--persistence). For v2 image challenges, pair it with a solver service.
 
 ## Notes & limitations
 
-- The port mirrors the real implemented behavior in the Python package, plus the stealth and emulation additions described above.
+- `markdown()`'s main-content detection is a heuristic (semantic tags, roles, class hints, link density), not Readability. Use `mainContent: false` when it trims too much.
+- `snapshot()` uses the CDP Accessibility domain, the same source Playwright's snapshot uses. Selectors from `generateExtractor()` run with `querySelectorAll` in the isolated world, so they do not reach into closed shadow roots; for those, use `extract()` (Markdown/snapshot input) or `observe()`.
 - No JavaScript fingerprint spoofing is injected by default on a normal desktop Chrome: native behavior is harder to detect than patched APIs. The stealth gains come from avoiding `Runtime.enable`, cleaning the headless UA/client-hints, generic world names, careful launch flags, and human-like input. Bring your own patches via `tab.addInitScript` if a target needs them.
 - **Under `channel:'headless-shell'`** the lib applies a small set of **conditional** shims that close two specific shell-only tells — it does **not** claim to make the shell binary indistinguishable from a real headful Chrome. The shims, each a no-op when the value is already real and written to match Chrome's native descriptor shape (enumerable own data property for `window.chrome`; prototype accessors with native-looking `toString` for `navigator.connection`): a minimal `window.chrome`/`chrome.runtime` (only when missing) and a non-zero `navigator.connection.rtt` (only when it reads `0`). Residual shell gaps are deliberately left untouched (a fabricated `navigator.plugins`/WebGPU adapter is itself a tell — see the research doc) and remain soft-target limitations; the dominant lever stays the IP. The lib also threads the **real, live GREASE brand** (read from `navigator.userAgentData`) into the Client-Hints instead of a hard-coded value that rotates stale, and **verifies a WebGL context exists before installing the WebGL string spoof** (a `getParameter`-only spoof is inert — and incoherent — with no context behind it; against render-hash anti-bots like DataDome Picasso it's worse than honest, so keep `spoofWebGL` for soft targets only).
 - WebGL string spoofing is for **soft targets only** — it can't beat a forced render-hash. For hard targets, run a real GPU.
@@ -634,10 +824,10 @@ Starring the repo helps too — it's how other developers find the project.
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](./LICENSE). Free for noncommercial use; contact the author for a commercial license.
+[MIT](./LICENSE). Versions up to 0.7.0 were published under PolyForm Noncommercial 1.0.0; from 0.8.0 on the library is MIT.
 
 [iproyal]: https://iproyal.com/?r=eurafaeldecarvalho
-[brightdata]: https://brightdata.com
+[brightdata]: https://get.brightdata.com/i1x1dea5t9na
 [hostinger]: https://www.hostinger.com/vps-hosting?REFERRALCODE=9PIRAFAELLV8
 [2captcha]: https://2captcha.com/auth/register/?from=12417190
 [anticaptcha]: https://getcaptchasolution.com/yykljfdcin

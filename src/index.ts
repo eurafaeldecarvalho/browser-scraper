@@ -7,6 +7,7 @@ export {
   DEFAULT_WEBGL_VENDOR,
   DEFAULT_WEBGL_RENDERER,
   resolveSparticuz,
+  type BrowserOptions,
   type ResolvedChromium,
 } from "./core/browser";
 export { Tab, Dialog, type WaitUntil, type TabStealth } from "./core/tab";
@@ -36,4 +37,19 @@ export { buildEvasionSource, type EvasionOptions } from "./stealth/evasions";
 export { ShadowRootAccessor } from "./shadow/shadow-root";
 export { findChrome, getChromeVersion } from "./utils/chrome-finder";
 
-export const __version__ = "0.7.0";
+export {
+  scrape,
+  detectBlock,
+  ScrapeError,
+  type ScrapeOptions,
+  type ScrapeResult,
+  type ScrapeFormat,
+  type ScrapeTier,
+  type ScrapeAttempt,
+} from "./scrape";
+export { htmlToMarkdown, treeToMarkdown, type MarkdownOptions, type MarkdownResult } from "./content/markdown";
+export { extractMetadata, type PageMetadata } from "./content/metadata";
+export { renderSnapshot, type SnapshotOptions } from "./content/snapshot";
+export { McpServer, parseEnvFile, type McpServerOptions } from "./mcp/server";
+
+export const __version__ = "0.8.0";

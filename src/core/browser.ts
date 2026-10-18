@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -100,7 +100,7 @@ export async function resolveSparticuz(): Promise<ResolvedChromium> {
 
 type StealthScreen = { width: number; height: number };
 
-type BrowserOptions = {
+export type BrowserOptions = {
   chromePath?: string | null;
   headless?: boolean;
   userDataDir?: string | null;
@@ -504,14 +504,24 @@ export class Browser {
         process.once("exit", () => resolve());
       });
 
-      process.kill("SIGTERM");
-      await Promise.race([exited, delay(5_000)]);
+      if (globalThis.process.platform === "win32" && process.pid) {
+        // SIGTERM on Windows terminates only the browser process; its renderer /
+        // GPU / crashpad children linger ~30s holding the inherited stderr pipe,
+        // which keeps Node alive after close(). Kill the whole tree instead.
+        spawnSync("taskkill", ["/pid", String(process.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      } else {
+        process.kill("SIGTERM");
+      }
+      await Promise.race([exited, delay(5_000, undefined, { ref: false })]);
 
-      if (process.exitCode === null) {
+      if (process.exitCode === null && process.signalCode === null) {
         process.kill("SIGKILL");
-        await Promise.race([exited, delay(1_000)]);
+        await Promise.race([exited, delay(1_000, undefined, { ref: false })]);
       }
 
+      // Any surviving helper still holds the stderr pipe open; drop our end so
+      // it can't keep the event loop alive.
+      process.stderr?.destroy();
       this._process = null;
     }
 
@@ -547,6 +557,16 @@ export class Browser {
     await tab.connect();
     this._tabs.push(tab);
     return tab;
+  }
+
+  // Closes the tab's page target in Chrome (tab.close() only drops the CDP
+  // connection and leaves the page open).
+  async closeTab(tab: Tab): Promise<void> {
+    await tab.close().catch(() => undefined);
+    this._tabs = this._tabs.filter((entry) => entry !== tab);
+    if (this._debug_port && tab.target_id) {
+      await fetch(`http://127.0.0.1:${this._debug_port}/json/close/${tab.target_id}`).catch(() => undefined);
+    }
   }
 
   async getTabs(): Promise<Record<string, any>[]> {
