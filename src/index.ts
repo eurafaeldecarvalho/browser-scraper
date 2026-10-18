@@ -52,4 +52,4 @@ export { extractMetadata, type PageMetadata } from "./content/metadata";
 export { renderSnapshot, type SnapshotOptions } from "./content/snapshot";
 export { McpServer, parseEnvFile, type McpServerOptions } from "./mcp/server";
 
-export const __version__ = "0.8.0";
+export const __version__ = "0.8.1";

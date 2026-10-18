@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] — 2026-10-17
+
+### Fixed
+- **Stealth:** out-of-process iframes (e.g. Cloudflare Turnstile's `challenges.cloudflare.com` widget) now receive the User-Agent / Client-Hints and `hardwareConcurrency` overrides. Before this, they read the real UA, which is `HeadlessChrome/…` in headless mode.
+- `solveTurnstile()` works on pages with several widgets, such as responsive duplicates where one is hidden off-screen. It is now scoped to one visible, in-viewport widget, waits for an animating widget to settle before clicking (clicks used to land beside the checkbox), and checks success on that widget's own response field.
+- A Turnstile test sitekey that passes (it mints `XXXX.DUMMY.TOKEN.XXXX`) is now reported as `{ solved: true, token: null }` instead of a failure. Verified 10/10 on nowsecure.nl, headless and headful.
+
 ## [0.8.0] — 2026-10-17
 
 The "AI-ready" release: the stealth browser becomes a browser layer for LLMs and agents.
@@ -44,5 +51,6 @@ The "AI-ready" release: the stealth browser becomes a browser layer for LLMs and
 
 - Stealth and User-Agent management improvements.
 
+[0.8.1]: https://github.com/eurafaeldecarvalho/browser-scraper/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/eurafaeldecarvalho/browser-scraper/compare/95268f9...v0.8.0
 [0.7.0]: https://github.com/eurafaeldecarvalho/browser-scraper/commits/95268f9
