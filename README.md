@@ -1,6 +1,6 @@
 # Browser Scraper: the stealth browser for web scraping and AI agents
 
-**Undetected Chrome for Node.js that reads and operates the sites that block bots. Use it as a library, a CLI or an MCP server for Claude, Cursor and Codex. It turns any page, including closed Shadow DOM and cross-origin iframes, into clean Markdown, structured data or an accessibility snapshot an agent can click through. Local, free, MIT, bring-your-own-LLM.**
+**Stealth Chrome for Node.js that reads and operates the sites that block bots. Use it as a library, a CLI or an MCP server for Claude, Cursor and Codex. It turns any page, including closed Shadow DOM and cross-origin iframes, into clean Markdown, structured data or an accessibility snapshot an agent can click through. Local, free, MIT, bring-your-own-LLM.**
 
 [![npm version](https://img.shields.io/npm/v/@eurafaeldecarvalho/browser-scraper.svg)](https://www.npmjs.com/package/@eurafaeldecarvalho/browser-scraper)
 [![CI](https://github.com/eurafaeldecarvalho/browser-scraper/actions/workflows/ci.yml/badge.svg)](https://github.com/eurafaeldecarvalho/browser-scraper/actions/workflows/ci.yml)
@@ -748,7 +748,7 @@ WebRTC is left enabled (fully disabling it is itself an anomaly) but locked down
 
 ## Alternatives — how it compares
 
-If you're shopping for an **undetected Puppeteer / Playwright alternative**, here's where this library sits. It targets the same job as stock Puppeteer + `puppeteer-extra-plugin-stealth` or `puppeteer-real-browser`, but starts from raw CDP instead of patching a high-level driver after the fact.
+If you're shopping for a **stealth Puppeteer / Playwright alternative**, here's where this library sits. It targets the same job as stock Puppeteer + `puppeteer-extra-plugin-stealth` or `puppeteer-real-browser`, but drives real Chrome over raw CDP instead of patching a high-level driver after the fact.
 
 | Capability | Puppeteer / Playwright | + puppeteer-extra-plugin-stealth | puppeteer-real-browser | **browser-scraper** |
 | --- | :---: | :---: | :---: | :---: |
@@ -778,7 +778,7 @@ Use Stagehand or browser-use if you want an autonomous agent loop. Use browser-s
 
 ## FAQ
 
-### How do I make Puppeteer undetected / pass bot detection in Node.js?
+### How do I pass bot detection with stealth Chrome in Node.js?
 The detectable tells are the `Runtime.enable` CDP leak, the `HeadlessChrome` User-Agent/client-hints, and cross-layer fingerprint mismatches. This library avoids `Runtime.enable` entirely (all JS runs via `Page.createIsolatedWorld` + `Runtime.evaluate`), strips the headless UA, and derives one coherent persona — see [Stealth, in depth](#stealth-in-depth). Verified against `bot.sannysoft.com` (0 failures), CreepJS (0% headless), and `bot-detector.rebrowser.net`.
 
 ### How do I bypass Cloudflare Turnstile in Node.js?

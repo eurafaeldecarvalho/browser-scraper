@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- Public copy now says stealth Chrome / real Chrome over raw CDP. The README proof line with detector results is unchanged.
+- `server.json` description is within the MCP Registry's 100-character limit.
+
 ## [0.8.3] — 2026-10-27
 
 ### Fixed

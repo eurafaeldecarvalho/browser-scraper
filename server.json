@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
   "name": "io.github.eurafaeldecarvalho/browser-scraper",
   "title": "Browser Scraper",
-  "description": "Stealth Chrome for AI agents: browse bot-protected sites, Turnstile, closed Shadow DOM, clean Markdown.",
+  "description": "Stealth Chrome for AI agents: bot-protected sites, Turnstile, closed Shadow DOM, clean Markdown.",
   "repository": {
     "url": "https://github.com/eurafaeldecarvalho/browser-scraper",
     "source": "github"
