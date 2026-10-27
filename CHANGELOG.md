@@ -2,11 +2,12 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.8.3] — 2026-10-27
 
 ### Fixed
 - `scrape()` no longer reports "blocked" on a page that keeps a Turnstile widget after the stealth tier solved it (nowsecure.nl). A short page like that is returned with the reason "solved challenge still on the page (may be a gate)", because it can't be told apart from a site's own Turnstile form; Cloudflare interstitials, in any language, are still a block.
 - `Browser.close()` no longer throws `ENOTEMPTY` when Chrome's helper processes are still writing into the temporary profile; it retries, then leaves the folder behind.
+- `__version__` and `server.json` report the package version again (they were left at 0.8.1).
 
 ## [0.8.2] — 2026-10-27
 
