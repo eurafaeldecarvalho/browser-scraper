@@ -10,6 +10,10 @@
 
 **CreepJS: 0% headless, 0% stealth · `bot.sannysoft.com`: 0 failures · no `Runtime.enable` leak** ([what that means, and where it stops](#passes-the-bot-detectors-people-actually-use))
 
+<img src="https://raw.githubusercontent.com/eurafaeldecarvalho/browser-scraper/main/docs/demo.gif" alt="Plain headless Chrome stuck on a Cloudflare Turnstile test page while browser-scraper solves it; the 4 lines of code; bot.sannysoft.com all green; adding the MCP server to Claude Code" width="960">
+
+<sub>Recorded on one desktop PC: the Turnstile test page at nowsecure.nl in headless mode, bot.sannysoft.com headful on the PC's own GPU.</sub>
+
 ```ts
 import { scrape } from "@eurafaeldecarvalho/browser-scraper";
 
