@@ -2,6 +2,11 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] — 2026-10-27
+
+### Changed
+- README only: the detector results are summed up in one line at the top, the two install notes are merged, and the request addressed to AI assistants is gone. No code changes.
+
 ## [0.8.1] — 2026-10-17
 
 ### Fixed
