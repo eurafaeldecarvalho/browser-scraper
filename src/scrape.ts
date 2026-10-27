@@ -62,17 +62,26 @@ export class ScrapeError extends Error {
 }
 
 const BLOCK_STATUS = new Set([401, 403, 407, 429, 503]);
+// The Turnstile widget marker: a widget embedded in a real page stays in its
+// markup after it is solved, so it only counts while the challenge is unsolved.
+// The challenge-platform markers below it mark the interstitial itself (in any
+// language) and always count.
+const TURNSTILE_MARKER = /challenges\.cloudflare\.com|cf-turnstile/i;
 const CHALLENGE_MARKERS = [
   /<title>\s*(just a moment|attention required|access denied|verifying you are human|please wait|security check)/i,
-  /challenges\.cloudflare\.com|cf-turnstile|_cf_chl_opt|cf-browser-verification|cf_chl_/i,
+  TURNSTILE_MARKER,
+  /_cf_chl_opt|cf-browser-verification|cf_chl_/i,
   /captcha-delivery\.com|geo\.captcha-delivery|datadome/i,
   /perimeterx|px-captcha|_pxhd/i,
   /\/_Incapsula_Resource|incap_ses_/i,
   /g-recaptcha|h-captcha|hcaptcha\.com\/1\/api/i,
 ];
 
+// Reasons that still return the page: it is short, or it may still be gated.
+const isSoftReason = (reason: string) => reason.startsWith("almost no content") || reason.startsWith("solved challenge");
+
 // Why a fetched page should not be trusted as the real content, or null.
-export function detectBlock({ status, html, markdown }: { status?: number | null; html: string; markdown?: string }): string | null {
+export function detectBlock({ status, html, markdown, challengeSolved = false }: { status?: number | null; html: string; markdown?: string; challengeSolved?: boolean }): string | null {
   if (status != null && BLOCK_STATUS.has(status)) {
     return `HTTP ${status}`;
   }
@@ -80,15 +89,26 @@ export function detectBlock({ status, html, markdown }: { status?: number | null
   // article (e.g. a blog post about Cloudflare) must not count.
   const text = markdown ?? htmlToMarkdown(html, { mainContent: false, links: "none", images: false }).markdown;
   const head = html.slice(0, 20_000);
+  let solvedWidget = false;
   for (const marker of CHALLENGE_MARKERS) {
     if (marker.test(head) && text.length < 2_000) {
+      if (challengeSolved && marker === TURNSTILE_MARKER) {
+        solvedWidget = true;
+        continue;
+      }
       return `challenge page (${marker.source.split("|")[0].replace(/\\/g, "").slice(0, 40)})`;
     }
   }
+  if (text.trim().length < 200 && (/<noscript[^>]*>[^<]*(enable|need|requires?)[^<]*javascript/i.test(html) || /<div id="(root|app|__next)">\s*<\/div>/i.test(html))) {
+    return "needs JavaScript (empty app shell)";
+  }
+  // A short page that keeps a solved widget may be the real page (nowsecure.nl)
+  // or a site's own Turnstile gate still waiting for a submit; the markup can't
+  // tell them apart, so the page is returned but flagged.
+  if (solvedWidget) {
+    return "solved challenge still on the page (may be a gate)";
+  }
   if (text.trim().length < 200) {
-    if (/<noscript[^>]*>[^<]*(enable|need|requires?)[^<]*javascript/i.test(html) || /<div id="(root|app|__next)">\s*<\/div>/i.test(html)) {
-      return "needs JavaScript (empty app shell)";
-    }
     return "almost no content";
   }
   return null;
@@ -119,7 +139,7 @@ export async function scrape(options: ScrapeOptions): Promise<ScrapeResult> {
       attempts.push({ tier: "http", ok: !reason, reason: reason ?? undefined, ms: Date.now() - started });
 
       if (!reason || tiers.length === 1) {
-        if (reason && !reason.startsWith("almost no content")) {
+        if (reason && !isSoftReason(reason)) {
           throw new ScrapeError(`scrape(${options.url}) http tier: ${reason}`, attempts);
         }
         return {
@@ -153,6 +173,7 @@ export async function scrape(options: ScrapeOptions): Promise<ScrapeResult> {
   try {
     tab = await browser.newTab();
     let loaded = false;
+    let challengeSolved = false;
 
     for (const tier of tiers.filter((t) => t !== "http")) {
       const started = Date.now();
@@ -168,7 +189,8 @@ export async function scrape(options: ScrapeOptions): Promise<ScrapeResult> {
         if (tier === "stealth") {
           await tab.ambientActivity({ durationMs: 1_200 });
           if (await tab.turnstilePresent()) {
-            await tab.solveTurnstile({ timeoutMs: Math.min(timeout, 30_000) });
+            const solve = await tab.solveTurnstile({ timeoutMs: Math.min(timeout, 30_000) });
+            challengeSolved = Boolean(solve?.solved);
           }
           // A solved challenge usually redirects to the real page.
           await tab.waitForNavigation({ timeout: 8_000 }).catch(() => undefined);
@@ -177,19 +199,19 @@ export async function scrape(options: ScrapeOptions): Promise<ScrapeResult> {
 
         const html = await tab.content();
         const md = await tab.markdown({ ...options.markdown });
-        const reason = detectBlock({ html, markdown: md.markdown });
+        const reason = detectBlock({ html, markdown: md.markdown, challengeSolved });
         attempts.push({ tier, ok: !reason, reason: reason ?? undefined, ms: Date.now() - started });
 
         // Escalate to stealth only for a real block: a short page that rendered
         // fine in the browser is just a short page.
-        const blocked = Boolean(reason) && !reason!.startsWith("almost no content");
+        const blocked = Boolean(reason) && !isSoftReason(reason!);
         const is_last = tier === tiers[tiers.length - 1];
         if (blocked && !is_last) {
           continue;
         }
         // A challenge / error page is never returned as content; a page that is
         // merely short is (some pages are tiny).
-        if (reason && !reason.startsWith("almost no content")) {
+        if (reason && !isSoftReason(reason)) {
           throw new ScrapeError(`scrape(${options.url}) blocked on every tier: ${attempts.map((a) => `${a.tier}: ${a.reason}`).join("; ")}`, attempts);
         }
 

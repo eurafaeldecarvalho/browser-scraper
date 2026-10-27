@@ -91,4 +91,27 @@ test("detectBlock flags challenges, error statuses and app shells", () => {
   // A long article that merely mentions Cloudflare is not a challenge.
   const long = `<html><body><main><h1>How Cloudflare works</h1><p>${"cf-turnstile challenges.cloudflare.com explained. ".repeat(80)}</p></main></body></html>`;
   assert.equal(detectBlock({ status: 200, html: long }), null);
+  // Cloudflare's bot-detection script sits on ordinary pages; it is not a challenge.
+  const jsd = `<html><head><title>Tiny</title></head><body><p>Hello</p><script>a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js'</script></body></html>`;
+  assert.equal(detectBlock({ status: 200, html: jsd }), "almost no content");
+});
+
+test("detectBlock ignores a Turnstile widget that stays on the page after it was solved", () => {
+  // nowsecure.nl: the real page is tiny and keeps the solved widget in its markup.
+  const page = `<html><head><title>nowsecure.nl</title><script src="https://challenges.cloudflare.com/turnstile/v0/api.js"></script></head><body><h2>NOWSECURE</h2><h3>by nodriver</h3><div class="cf-turnstile"></div></body></html>`;
+  assert.match(String(detectBlock({ html: page })), /challenge/);
+  // The page can't be told apart from a site's own Turnstile gate, so it is returned flagged, not as clean content.
+  assert.match(String(detectBlock({ html: page, challengeSolved: true })), /^solved challenge still on the page/);
+  // A long real page that keeps a solved widget is just content.
+  const real = page.replace("<h3>by nodriver</h3>", `<p>${"Real article text. ".repeat(120)}</p>`);
+  assert.equal(detectBlock({ html: real, challengeSolved: true }), null);
+  // A solved widget never softens another block on the same page.
+  assert.match(String(detectBlock({ html: '<html><body><div id="root"></div><div class="cf-turnstile"></div></body></html>', challengeSolved: true })), /JavaScript/);
+  assert.match(String(detectBlock({ html: '<html><body><div class="cf-turnstile"></div><script src="https://geo.captcha-delivery.com/c.js"></script></body></html>', challengeSolved: true })), /challenge/);
+  // An interstitial is still a block even when a widget on it reported success.
+  const interstitial = `<html><head><title>Just a moment...</title></head><body><div class="cf-turnstile"></div></body></html>`;
+  assert.match(String(detectBlock({ html: interstitial, challengeSolved: true })), /challenge/);
+  // A translated interstitial has no English title, but its challenge-platform script still marks it.
+  const localized = `<html><head><title>Einen Moment…</title><script>window._cf_chl_opt={cvId:'3'};</script><script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script></head><body><div class="cf-turnstile"></div></body></html>`;
+  assert.match(String(detectBlock({ html: localized, challengeSolved: true })), /challenge/);
 });

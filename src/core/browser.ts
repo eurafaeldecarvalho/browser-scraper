@@ -58,6 +58,24 @@ function webrtc_flag(has_proxy: boolean): string {
     : "--force-webrtc-ip-handling-policy=default_public_interface_only";
 }
 
+// Removes the temporary profile. Chrome's helper processes (crashpad, GPU) can
+// still be writing into it for a moment after the browser exits, which makes a
+// recursive delete fail with ENOTEMPTY; retry a few times, then leave it behind
+// rather than make close() throw.
+export async function removeProfileDir(
+  dir: string,
+  { rm: remove = rm, attempts = 5, retryDelayMs = 200 }: { rm?: typeof rm; attempts?: number; retryDelayMs?: number } = {},
+): Promise<void> {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await remove(dir, { recursive: true, force: true });
+      return;
+    } catch {
+      if (i < attempts) await delay(retryDelayMs);
+    }
+  }
+}
+
 export class BrowserError extends Error {
   constructor(message: string) {
     super(message);
@@ -526,7 +544,7 @@ export class Browser {
     }
 
     if (this._temp_dir) {
-      await rm(this._temp_dir, { recursive: true, force: true });
+      await removeProfileDir(this._temp_dir);
       this._temp_dir = null;
     }
   }
