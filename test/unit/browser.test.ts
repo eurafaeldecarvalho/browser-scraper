@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { removeProfileDir } from "../../src/core/browser";
+import { Browser, removeProfileDir } from "../../src/core/browser";
+import { Tab } from "../../src/core/tab";
 
 const enotempty = () => Object.assign(new Error("ENOTEMPTY: directory not empty"), { code: "ENOTEMPTY" });
 
@@ -20,4 +21,27 @@ test("removeProfileDir never makes close() throw when the profile can't be remov
     throw enotempty();
   };
   await assert.doesNotReject(removeProfileDir("/tmp/gdnium_x", { rm, retryDelayMs: 1 }));
+});
+
+test("attachTab closes the CDP socket when connect fails midway", async () => {
+  const browser = new Browser({ headless: true });
+  (browser as any).getTabs = async () => [{ id: "T1", type: "page", url: "about:blank", webSocketDebuggerUrl: "ws://127.0.0.1:1/x" }];
+  const proto = Tab.prototype as any;
+  const connect = proto.connect;
+  const close = proto.close;
+  let closed = 0;
+  proto.connect = async () => {
+    throw new Error("refused");
+  };
+  proto.close = async () => {
+    closed += 1;
+  };
+  try {
+    await assert.rejects(browser.attachTab("T1"), /refused/);
+    assert.equal(closed, 1);
+    assert.equal((browser as any)._tabs.length, 0);
+  } finally {
+    proto.connect = connect;
+    proto.close = close;
+  }
 });

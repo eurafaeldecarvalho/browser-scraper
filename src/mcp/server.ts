@@ -1294,7 +1294,8 @@ export class McpServer {
     } catch {
       return null;
     } finally {
-      await tab.cdp.send("DOMStorage.disable").catch(() => undefined);
+      // Cleanup: must run even if the call went stale meanwhile.
+      await runUnguarded(() => tab.cdp.send("DOMStorage.disable")).catch(() => undefined);
     }
   }
 

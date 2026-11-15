@@ -693,7 +693,14 @@ export class Browser {
       throw new BrowserError(`No page target with id ${targetId}`);
     }
     const tab = new Tab(target_info.webSocketDebuggerUrl, target_info, this._build_tab_stealth());
-    await tab.connect();
+    try {
+      await tab.connect();
+    } catch (error) {
+      // A connect cut short (e.g. refused by a send guard, page gone) must not
+      // leave an untracked CDP socket open on the page.
+      await tab.close().catch(() => undefined);
+      throw error;
+    }
     this._tabs.push(tab);
     return tab;
   }
