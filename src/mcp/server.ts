@@ -596,10 +596,16 @@ export class McpServer {
       if (!entry || entry.state !== "inProgress" || p.state === "inProgress") {
         return;
       }
-      if (p.state === "completed") {
-        entry.path = this._finalize_download(entry);
+      if (p.state !== "completed") {
+        entry.state = p.state;
+        return;
       }
-      entry.state = p.state;
+      // Stays "inProgress" until the file has its final name, so
+      // wait_for_download never returns the GUID path mid-rename.
+      void finalize_download(this._downloads_dir, entry.guid, entry.suggestedFilename).then((path) => {
+        entry.path = path;
+        entry.state = "completed";
+      });
     });
     await cdp.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: this._downloads_dir, eventsEnabled: true });
   }
@@ -615,32 +621,6 @@ export class McpServer {
       this._downloads.splice(Math.max(0, index), 1);
     }
     this._downloads.push({ guid: String(p.guid), url: String(p.url ?? ""), suggestedFilename: String(p.suggestedFilename ?? "download"), state: "inProgress", path: null, reported: false, noted: false });
-  }
-
-  private _finalize_download(entry: DownloadEntry): string {
-    const from = join(this._downloads_dir, entry.guid);
-    const safe = safe_filename(entry.suggestedFilename);
-    const ext = extname(safe);
-    const stem = safe.slice(0, safe.length - ext.length);
-    // Reserve the name atomically ("wx"): several bots may share the folder and
-    // finish a same-named download at once; a check-then-rename would let one
-    // overwrite the other.
-    for (let n = 0; n < 1_000; n++) {
-      const to = join(this._downloads_dir, n === 0 ? safe : `${stem} (${n})${ext}`);
-      try {
-        closeSync(openSync(to, "wx"));
-      } catch {
-        continue;
-      }
-      try {
-        renameSync(from, to);
-        return to;
-      } catch {
-        rmSync(to, { force: true });
-        return from;
-      }
-    }
-    return from;
   }
 
   // Per-tab hooks, installed once per page target: dialogs.
@@ -2289,6 +2269,41 @@ export function find_option(snapshot: string, want: string): { ref: string; name
     }
   }
   return options.find((option) => norm(option.name) === target) ?? options.find((option) => norm(option.name).includes(target)) ?? null;
+}
+
+// Gives a finished download (saved by Chrome under its GUID) the site's file
+// name. The name is reserved atomically ("wx"): several bots may share the
+// folder and finish a same-named download at once. On Windows the rename often
+// fails for a moment (EPERM/EBUSY) while antivirus or the indexer still holds
+// the fresh file, so it is retried before falling back to the GUID path.
+export async function finalize_download(dir: string, guid: string, suggested: string, rename: (from: string, to: string) => void = renameSync, retry_ms = 150, attempts = 10): Promise<string> {
+  const from = join(dir, guid);
+  const safe = safe_filename(suggested);
+  const ext = extname(safe);
+  const stem = safe.slice(0, safe.length - ext.length);
+  for (let n = 0; n < 1_000; n++) {
+    const to = join(dir, n === 0 ? safe : `${stem} (${n})${ext}`);
+    try {
+      closeSync(openSync(to, "wx"));
+    } catch {
+      continue;
+    }
+    for (let attempt = 1; ; attempt++) {
+      try {
+        rename(from, to);
+        return to;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException)?.code;
+        if (attempt < attempts && (code === "EPERM" || code === "EBUSY" || code === "EACCES")) {
+          await delay(retry_ms);
+          continue;
+        }
+        rmSync(to, { force: true });
+        return from;
+      }
+    }
+  }
+  return from;
 }
 
 // Download names come from the site: keep only a plain file name that Windows
