@@ -231,14 +231,14 @@ describe("mcp tabs (e2e)", { skip: chrome ? false : "Chrome not found" }, () => 
   });
 
   test("new_tab / list_tabs / switch_tab / close_tab, including a site-opened tab", async () => {
-    assert.match(await call("navigate", { url: `${server.origin}/popup` }), /^Tab: t1\nPage: Opener/);
-    assert.match(await call("new_tab", { url: `${server.origin}/products` }), /^Tab: t2\nPage: Products/);
+    assert.match(await call("navigate", { url: `${server.origin}/popup` }), /^Tab: t1\n<untrusted-page-content>\nPage: Opener/);
+    assert.match(await call("new_tab", { url: `${server.origin}/products` }), /^Tab: t2\n<untrusted-page-content>\nPage: Products/);
     const two = await call("list_tabs");
     assert.match(two, /\* t2 {2}Products/);
     assert.match(two, / {2}t1 {2}Opener/);
 
     const back = await call("switch_tab", { id: "t1" });
-    assert.match(back, /^Tab: t1\nPage: Opener/);
+    assert.match(back, /^Tab: t1\n<untrusted-page-content>\nPage: Opener/);
     assert.match(await call("snapshot"), /Opener/);
 
     // The page opens a tab itself (target=_blank): it must show up and be usable.
@@ -251,7 +251,7 @@ describe("mcp tabs (e2e)", { skip: chrome ? false : "Chrome not found" }, () => 
       listed = await call("list_tabs");
     }
     assert.match(listed, /t3 {2}Products/);
-    assert.match(await call("switch_tab", { id: "t3" }), /^Tab: t3\nPage: Products/);
+    assert.match(await call("switch_tab", { id: "t3" }), /^Tab: t3\n<untrusted-page-content>\nPage: Products/);
     assert.match(await call("markdown"), /# Products/);
 
     assert.match(await call("close_tab", { id: "t2" }), /Current tab unchanged/);

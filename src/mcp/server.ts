@@ -954,6 +954,11 @@ export class McpServer {
     return `Tab: ${this._tab_id_for(tab.target_id)}`;
   }
 
+  // Title and URL are chosen by the site: keep them inside the markers.
+  private _page_line(title: string, url: string): string {
+    return this._untrusted(`Page: ${title}\nURL: ${url}`);
+  }
+
   private async _require_tab(): Promise<Tab> {
     // An abandoned call must not pick up the tab re-attached for the calls
     // that came after it and keep acting on it.
@@ -972,7 +977,7 @@ export class McpServer {
       const page = (await this._list_pages()).find((entry) => entry.targetId === tab.target_id);
       const notes = await this._collect_notes();
       return [
-        `${await this._tab_header(tab)}\nPage: ${page?.title ?? ""}\nURL: ${page?.url ?? ""}`,
+        `${await this._tab_header(tab)}\n${this._page_line(page?.title ?? "", page?.url ?? "")}`,
         notes,
         `\n⚠ A ${pending.type} dialog is open: ${this._untrusted(pending.message)}\nAnswer it with handle_dialog (accept true/false${pending.type === "prompt" ? ", promptText" : ""}).`,
       ]
@@ -981,7 +986,7 @@ export class McpServer {
     }
     const url = await tab.url();
     const title = await tab.title().catch(() => "");
-    let text = `${await this._tab_header(tab)}\nPage: ${title}\nURL: ${url}`;
+    let text = `${await this._tab_header(tab)}\n${this._page_line(title, url)}`;
     const notes = await this._collect_notes();
     if (notes) {
       text += `\n${notes}`;
@@ -1396,10 +1401,10 @@ export class McpServer {
       const chosen = await element.selectOption({ value, label });
       if (!chosen) {
         const options: string[] = await element.callFunction({ fn: "function() { return Array.from(this.options).map((o) => o.label + ' (' + o.value + ')'); }" });
-        throw new Error(`No option "${label ?? value}" in ${ref}. Options: ${options.join(", ")}`);
+        throw new Error(`No option "${label ?? value}" in ${ref}. Options: ${this._untrusted(options.join(", "))}`);
       }
       await tab.sleep({ milliseconds: 300 });
-      return `${chosen.label} (value ${chosen.value})`;
+      return this._untrusted(`${chosen.label} (value ${chosen.value})`);
     }
 
     // Custom dropdown: open it like a person, then click the matching option.
@@ -1419,7 +1424,7 @@ export class McpServer {
     }
     await (await tab.byRef({ ref: option.ref })).click();
     await tab.sleep({ milliseconds: 500 });
-    return option.name;
+    return this._untrusted(option.name);
   }
 
   private async _set_checked(tab: Tab, ref: string, want: boolean): Promise<boolean> {
@@ -1960,7 +1965,7 @@ export class McpServer {
           const tab = await this._ready_tab();
           const snap = await this._snapshot_text(tab, args.diff && !args.interactiveOnly ? "diff" : "full", { interactive: Boolean(args.interactiveOnly) });
           const notes = await this._collect_notes();
-          return text(`${await this._tab_header(tab)}\nPage: ${await tab.title().catch(() => "")}\nURL: ${await tab.url()}${notes ? `\n${notes}` : ""}\n\n${snap}`);
+          return text(`${await this._tab_header(tab)}\n${this._page_line(await tab.title().catch(() => ""), await tab.url())}${notes ? `\n${notes}` : ""}\n\n${snap}`);
         },
       },
       {
@@ -2121,7 +2126,7 @@ export class McpServer {
             includeIframes: Boolean(args.includeIframes),
             links: args.links ?? "inline",
           });
-          return text(`# ${md.title}\nURL: ${md.url}\n\n${this._untrusted(md.markdown)}`);
+          return text(this._untrusted(`# ${md.title}\nURL: ${md.url}\n\n${md.markdown}`));
         },
       },
       {
@@ -2757,7 +2762,7 @@ export class McpServer {
             context: Math.min(5, Math.max(0, Number(args.context ?? 1) || 0)),
             limit: Math.min(100, Math.max(1, Number(args.limit ?? 20) || 20)),
           });
-          const header = `${await this._tab_header(tab)}\nURL: ${await tab.url()}`;
+          const header = `${await this._tab_header(tab)}\n${this._untrusted(`URL: ${await tab.url()}`)}`;
           if (found.matches === 0) {
             return text(`${header}\nNo element matches ${args.role ? `role ${String(args.role)} ` : ""}${args.text ? `text ${JSON.stringify(String(args.text))}` : ""}. Try a shorter text, another role, wait_for, or snapshot.`);
           }
@@ -3079,14 +3084,14 @@ export class McpServer {
             const cookies = ((await tab.cdp.send("Network.getCookies", { urls: [url] })).cookies ?? []) as Array<Record<string, any>>;
             const wanted = cookies.filter((cookie) => args.name === undefined || cookie.name === String(args.name));
             if (wanted.length === 0) {
-              return text(`No cookies${args.name ? ` named ${String(args.name)}` : ""} for ${url}.`);
+              return text(`No cookies${args.name ? ` named ${String(args.name)}` : ""} for ${this._untrusted(url)}`);
             }
             const lines = wanted.map((cookie) => {
               const expires = cookie.session || cookie.expires === -1 ? "session" : new Date(Number(cookie.expires) * 1_000).toISOString();
               const value = this._redact(String(cookie.value ?? ""));
               return `${cookie.name}=${value.length > 80 ? `${value.slice(0, 80)}…(${value.length} chars)` : value}  domain=${cookie.domain} path=${cookie.path} expires=${expires}${cookie.httpOnly ? " httpOnly" : ""}${cookie.secure ? " secure" : ""}${cookie.sameSite ? ` sameSite=${cookie.sameSite}` : ""}`;
             });
-            return text(`${wanted.length} cookie(s) for ${url}:\n${this._untrusted(lines.join("\n"))}`);
+            return text(`${wanted.length} cookie(s):\n${this._untrusted(`URL: ${url}\n${lines.join("\n")}`)}`);
           }
           if (!args.name) {
             throw new Error(`${action} needs name.`);
@@ -3108,14 +3113,14 @@ export class McpServer {
             if (result.success === false) {
               throw new Error(`Chrome rejected cookie ${String(args.name)} (check domain/secure/sameSite: SameSite=None needs secure).`);
             }
-            return text(`Cookie ${String(args.name)} set for ${url}.`);
+            return text(`Cookie ${String(args.name)} set for ${this._untrusted(url)}`);
           }
           if (action === "delete") {
             if (args.domain !== undefined) {
               this._check_url(`https://${String(args.domain).replace(/^\./, "")}/`);
             }
             await tab.cdp.send("Network.deleteCookies", { name: String(args.name), url, ...(args.domain ? { domain: String(args.domain) } : {}), ...(args.path ? { path: String(args.path) } : {}) });
-            return text(`Cookie ${String(args.name)} deleted for ${url}.`);
+            return text(`Cookie ${String(args.name)} deleted for ${this._untrusted(url)}`);
           }
           throw new Error(`action must be get, set or delete (got ${action}).`);
         },

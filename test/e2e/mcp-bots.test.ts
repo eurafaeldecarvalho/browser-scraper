@@ -88,7 +88,8 @@ describe("mcp bot tools over stdio (e2e)", { skip: chrome ? false : "Chrome not 
 
     // select_option: native <select> by label, custom combobox by option text.
     let out = await tool("select_option", { ref: ref(page, /combobox "Country"[^\n]*\[ref=(e\d+)\]/), label: "Portugal" });
-    assert.match(out.text, /Selected: Portugal \(value pt\)/);
+    assert.match(out.text, /Selected: <untrusted-page-content>\nPortugal \(value pt\)\n<\/untrusted-page-content>/);
+    assert.match(out.text, /\n<untrusted-page-content>\nPage: [^\n]*\nURL: http/);
     out = await tool("select_option", { ref: ref(out.text, /combobox: "Pick a color" \[ref=(e\d+)\]/), label: "Blue" });
     assert.match(out.text, /Color: Blue/);
 
