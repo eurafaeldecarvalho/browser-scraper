@@ -3857,6 +3857,10 @@ export function secret_forms(value: string): string[] {
     add(encodeURIComponent(value).replace(/%20/g, "+"));
     add(new URLSearchParams({ x: value }).toString().slice(2));
     add(encodeURI(value));
+    // nested in another URL's parameter (redirect_uri, next=, continue=)
+    add(encodeURIComponent(encodeURIComponent(value)));
+    add(encodeURIComponent(encodeURIComponent(value).replace(/%20/g, "+")));
+    add(encodeURIComponent(new URLSearchParams({ x: value }).toString().slice(2)));
   } catch {
     // lone surrogates: no URL form
   }
@@ -3866,6 +3870,26 @@ export function secret_forms(value: string): string[] {
   add(html.replace(/"/g, "&quot;"));
   add(html.replace(/"/g, "&quot;").replace(/'/g, "&#39;"));
   add(html.replace(/"/g, "&#34;").replace(/'/g, "&#39;"));
+  // numeric entities for every special char (&#38; &#34; ...) and the
+  // hex flavour, as emitted by some template engines
+  const numeric = (hex: boolean) =>
+    value.replace(/[&<>"']/g, (c) => (hex ? `&#x${c.charCodeAt(0).toString(16)};` : `&#${c.charCodeAt(0)};`));
+  add(numeric(false));
+  add(numeric(true));
+  // Go/Rails style JSON: "/" as "\/" and HTML-sensitive chars as \u00XX
+  add(
+    JSON.stringify(value)
+      .slice(1, -1)
+      .replace(/\//g, "\\/")
+      .replace(/[&<>']/g, (c) => `\\u00${c.charCodeAt(0).toString(16)}`),
+  );
+  // innerHTML text nodes escape only & < > (quotes stay raw); evaluate then
+  // JSON-escapes whatever HTML form it returned
+  add(html);
+  for (const form of [...forms]) {
+    if (form === value) continue;
+    add(JSON.stringify(form).slice(1, -1));
+  }
   return [...forms].sort((a, b) => b.length - a.length);
 }
 

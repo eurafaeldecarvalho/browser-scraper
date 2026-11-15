@@ -20,6 +20,21 @@ test("secret_forms covers URL, form, JSON and HTML encodings", () => {
   for (let i = 1; i < forms.length; i++) assert.ok(forms[i - 1].length >= forms[i].length);
 });
 
+test("secret_forms covers nested URL encoding, numeric entities and Go-style JSON", () => {
+  const secret = 'p@ss w0rd/"x&y';
+  const forms = secret_forms(secret);
+  for (const leaked of [
+    "p%2540ss%2520w0rd%252F%2522x%2526y", // redirect_uri=...%3Fpw%3D<secret>
+    "p%2540ss%2Bw0rd%252F%2522x%2526y",
+    "p@ss w0rd/&#34;x&#38;y",
+    "p@ss w0rd/&#x22;x&#x26;y",
+    'p@ss w0rd\\/\\"x\\u0026y',
+    'p@ss w0rd/\\"x&amp;y', // evaluate("document.body.innerHTML")
+  ]) {
+    assert.ok(forms.includes(leaked), `missing form ${leaked}`);
+  }
+});
+
 test("secret_forms of a plain value is just the value", () => {
   assert.deepEqual(secret_forms("hunter2secret"), ["hunter2secret"]);
 });
