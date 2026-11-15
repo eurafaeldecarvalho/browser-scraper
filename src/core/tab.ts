@@ -73,6 +73,11 @@ export class Tab {
   private readonly _world_name = `u${randomBytes(8).toString("hex")}`;
   private _oop_frame_sessions = new Map<string, string>();
   private _snapshot_refs = new Map<string, SnapshotRef>();
+  // Stable refs: element (session:backendNodeId) -> ref, kept across snapshots
+  // of the same document; the counter never goes back, so a ref is never reused
+  // for another element.
+  private _stable_refs = new Map<string, string>();
+  private _ref_counter = 0;
   // In-flight network requests of this page, for waitForNetworkIdle().
   // requestId -> start time. Requests older than INFLIGHT_STALE_MS stop
   // counting (long-polls, websockets, requests that never get a response).
@@ -591,6 +596,8 @@ export class Tab {
 
     this._frame_id = frame_id;
     this._invalidate_execution_context();
+    // A new document: its nodes are new elements.
+    this._stable_refs.clear();
   }
 
   private _on_frame_detached(params: Record<string, any>): void {
@@ -1909,7 +1916,20 @@ export class Tab {
       }
     }
 
-    const { text, refs } = renderSnapshot(frames, options);
+    if (this._stable_refs.size > 50_000) {
+      // Hours on one endless SPA document: bound the memo.
+      this._stable_refs.clear();
+    }
+    const refFor = (session_id: string | null, backend_node_id: number): string => {
+      const key = `${session_id ?? "page"}:${backend_node_id}`;
+      let ref = this._stable_refs.get(key);
+      if (!ref) {
+        ref = `e${++this._ref_counter}`;
+        this._stable_refs.set(key, ref);
+      }
+      return ref;
+    };
+    const { text, refs } = renderSnapshot(frames, { refFor, ...options });
     this._snapshot_refs = refs;
     return text;
   }

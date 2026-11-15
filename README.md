@@ -241,6 +241,20 @@ Or in any MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, �
 | `wait_for_download` | Waits for a download and returns the saved file path (`--downloads-dir`) |
 | `tab_info` / `reload` / `go_forward` | Cheap state check; reload; history forward |
 | `export_session` / `import_session` | Backs up / restores cookies + localStorage to an absolute `*.json` path (values never returned to the model). With `--allowed-domains` only those domains are exported/imported; an existing file that is not an earlier export is never overwritten |
+| `find` | Elements by visible text (or `/regex/`) and/or role, with their refs and a little context — no full snapshot (a few hundred tokens instead of tens of thousands on big pages) |
+| `element_info` | Tag, role/name, all attributes (`href`, `src`, `data-*`…), text, value, state and viewport box of one element |
+| `click` `button`/`doubleClick` | Right click (context menus), middle click, double click |
+| `click_at` | Click at viewport coordinates (canvas, maps, image-captcha tiles), human-like path |
+| `drag` | Press–move–release from a ref/selector/point to another: sliders, sortable lists, HTML5 drag-and-drop |
+| `drop_files` | Local images/videos/files into a drop zone or post composer as a real browser drag of files (`mode: "paste"` for Ctrl+V-style paste) |
+| `network_requests` / `response_body` | Requests the tabs made (XHR/Fetch/Document by default) and their bodies (JSON pretty-printed) |
+| `wait_for_response` | Waits for the API response an action triggered and returns status + body |
+| `cookies` | Get/set/delete cookies of the current site (or `url`), within `--allowed-domains` |
+| `save_pdf` | Prints the page to a PDF file (downloads folder by default) |
+| `emulate` | Geolocation (permission granted), timezone, locale for every tab; `reset` |
+| `solve_captcha` | reCAPTCHA v2 / hCaptcha checkbox; if an image challenge opens, returns its screenshot and box so a vision model can answer it with `click_at` |
+| `batch` | Several tool calls in one round-trip; only the last returns the page state |
+| `browser_status` | Health check without side effects: browser alive, profile, tabs, dialogs, downloads, JS heap |
 | `close_browser` | Closes Chrome gracefully (cookies flushed). The next call relaunches on the same profile, which also happens automatically if Chrome crashed or the user closed it (read-only calls and `navigate` are retried; page actions such as `click` report the relaunch instead of being repeated on a blank page) |
 
 **Guard rails:**
@@ -250,6 +264,8 @@ Or in any MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, �
 - `--secrets .env` lets the agent type `{{PASSWORD}}`. The value is filled in at keystroke time and redacted from everything returned.
 - `--dialogs accept|dismiss|manual` decides how JS dialogs are answered (default `accept`; every auto-answer is reported). In `manual` mode the action returns as soon as a dialog opens and the agent answers it with `handle_dialog`; nothing hangs.
 - `--downloads-dir <dir>` is where `wait_for_download` finds files (saved under the site's file name).
+- `--snapshot-mode full|diff|none` sets what actions return: the full snapshot (default), only the lines that changed since the tab's last snapshot (`diff`; refs are stable, so unchanged elements keep theirs), or just the tab header (`none`; use `find`/`snapshot` when needed).
+- The network log only listens to events of the `Network` domain the tab already enables; nothing new runs in the page (no `Runtime.enable`, no console capture — that would be a detection signal).
 - With `--user-data-dir`, a second Chrome on the same profile fails fast with a clear "already in use" error instead of a launch timeout. A Chrome left behind by a server that was hard-killed (e.g. `taskkill /F`) is detected through `browser-scraper.owner.json` in the profile and closed by the next start; a Chrome whose server is still running, a Chrome you opened by hand on the profile (e.g. for a manual login), or a sidecar naming another profile is never acted on: the Chrome must match the recorded pid, start time, `--remote-debugging-port` and this exact profile path.
 - Page content always comes back inside `<untrusted-page-content>` markers.
 - Other options: `--proxy`, `--headful`, `--user-data-dir`, `--geo BR`. The server is also listed for the MCP Registry (`server.json`), and an [Agent Skill](./skills/browser-scraper/SKILL.md) is included.
@@ -824,7 +840,7 @@ Run the bundled MCP server: `claude mcp add browser-scraper -- npx -y @eurafaeld
 `scrape({ url, formats: ["markdown"] })` returns clean main-content Markdown, escalating from plain HTTP to the stealth browser only when needed. For structured fields, use `extract()` with a Zod schema, or `generateExtractor()` to pay the LLM once per site layout instead of once per page.
 
 ### Does it solve CAPTCHAs or reCAPTCHA v3?
-It does not solve image/token CAPTCHAs. What it does is keep your reCAPTCHA **v3 score** high — human-like mouse/typing, ambient activity before a token-minting call, and a warmed persistent profile on a sticky residential IP — see [Identity & persistence](#identity--persistence). For v2 image challenges, pair it with a solver service.
+The MCP `solve_captcha` tool clicks the reCAPTCHA v2 / hCaptcha checkbox like a person, and when an image challenge opens it hands the agent the challenge's screenshot and coordinates so a vision-capable model can answer it with `click_at`. There is no built-in solver service. What it also does is keep your reCAPTCHA **v3 score** high — human-like mouse/typing, ambient activity before a token-minting call, and a warmed persistent profile on a sticky residential IP — see [Identity & persistence](#identity--persistence). For v2 image challenges, pair it with a solver service.
 
 ## Notes & limitations
 

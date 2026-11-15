@@ -36,6 +36,7 @@ mcp:
   --secrets <file>           .env file; the agent types values via {{NAME}} placeholders
   --dialogs <policy>         accept | dismiss | manual — JS alert/confirm/prompt handling (default accept)
   --downloads-dir <dir>      Where downloads are saved (default: <tmp>/browser-scraper-downloads)
+  --snapshot-mode <mode>     full | diff | none — page state returned after actions (default full)
 
 Examples:
   npx @eurafaeldecarvalho/browser-scraper markdown https://example.com
@@ -66,6 +67,7 @@ async function main(argv: string[]): Promise<number> {
       secrets: { type: "string" },
       dialogs: { type: "string" },
       "downloads-dir": { type: "string" },
+      "snapshot-mode": { type: "string" },
       interactive: { type: "boolean" },
     },
   });
@@ -97,6 +99,7 @@ async function main(argv: string[]): Promise<number> {
       secrets: values.secrets ? parseEnvFile(values.secrets) : undefined,
       dialogPolicy: parse_dialog_policy(values.dialogs),
       downloadsDir: values["downloads-dir"],
+      snapshotMode: parse_snapshot_mode(values["snapshot-mode"]),
       version: __version__,
     });
     process.stderr.write(`[browser-scraper] MCP server ${__version__} on stdio\n`);
@@ -205,4 +208,14 @@ function parse_dialog_policy(value: string | undefined): "accept" | "dismiss" | 
     return value;
   }
   throw new Error(`--dialogs must be accept, dismiss or manual (got ${value}).`);
+}
+
+function parse_snapshot_mode(value: string | undefined): "full" | "diff" | "none" | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "full" || value === "diff" || value === "none") {
+    return value;
+  }
+  throw new Error(`--snapshot-mode must be full, diff or none (got ${value}).`);
 }

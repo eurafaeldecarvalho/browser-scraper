@@ -114,6 +114,44 @@ more();feed.addEventListener('scroll',()=>{if(feed.scrollTop+feed.clientHeight>=
   "/form-frame": () => `<!doctype html><html><body><label>Frame field <input id="ff"></label><button onclick="document.getElementById('fo').textContent='frame got:'+document.getElementById('ff').value">Frame submit</button><p id="fo"></p></body></html>`,
   "/blocked": () => `<!doctype html><html><head><title>Just a moment...</title></head><body><div id="challenge-running">Checking your browser</div><script>window._cf_chl_opt={}</script></body></html>`,
   "/spa": () => `<!doctype html><html><head><title>SPA</title></head><body><div id="root"></div><noscript>You need to enable JavaScript to run this app.</noscript><script>document.getElementById('root').innerHTML='<main><h1>Rendered by JS</h1><p>' + 'This content only exists after JavaScript runs. '.repeat(5) + '</p></main>'</script></body></html>`,
+  "/tools": () => `<!doctype html><html><head><title>Tools fixture</title></head><body>
+<h1>Tools fixture</h1>
+<div id="composer" contenteditable="true" role="textbox" aria-label="What is happening" style="min-height:40px;border:1px solid #000"></div>
+<button id="dbl" ondblclick="document.getElementById('out').textContent='double clicked'">Double me</button>
+<button id="ctx" oncontextmenu="event.preventDefault();document.getElementById('out').textContent='context menu'">Right me</button>
+<p id="out"></p>
+<div id="track" style="position:relative;width:300px;height:30px;background:#ddd"><div id="knob" style="position:absolute;left:0;top:0;width:30px;height:30px;background:#333"></div></div>
+<p id="slid"></p>
+<div id="card" draggable="true" ondragstart="event.dataTransfer.setData('text/plain','card-1')" style="width:80px;height:40px;background:#9cf">Card</div>
+<div id="lane" ondragover="event.preventDefault()" ondrop="event.preventDefault();document.getElementById('dnd').textContent='dropped:'+event.dataTransfer.getData('text/plain')" style="width:200px;height:80px;border:2px dashed #000">Lane</div>
+<p id="dnd"></p>
+<div id="dropzone" ondragover="event.preventDefault()" ondrop="event.preventDefault();const f=event.dataTransfer.files;document.getElementById('dz').textContent='files:'+Array.from(f).map(x=>x.name+':'+x.size+':'+x.type).join(',')+':trusted='+event.isTrusted" style="width:300px;height:80px;border:2px dashed #555">Drop media here</div>
+<p id="dz"></p>
+<div id="pastebox" contenteditable="true" aria-label="Paste box" onpaste="event.preventDefault();const f=event.clipboardData.files;document.getElementById('pz').textContent='pasted:'+Array.from(f).map(x=>x.name+':'+x.size).join(',')" style="min-height:30px;border:1px solid #000"></div>
+<p id="pz"></p>
+<button onclick="fetch('/api/data?q=1',{method:'POST',body:'x'}).then(r=>r.json()).then(j=>document.getElementById('api').textContent='api:'+j.items.length)">Load data</button>
+<p id="api"></p>
+<a id="far" href="/products" data-id="42">Products link</a>
+<ul>${Array.from({ length: 200 }, (_, i) => `<li>Row ${i} <button>Edit ${i}</button></li>`).join("")}</ul>
+<button>Needle button</button>
+<script>
+const knob=document.getElementById('knob');let down=false,start=0;
+knob.addEventListener('mousedown',e=>{down=true;start=e.clientX});
+addEventListener('mousemove',e=>{if(down){knob.style.left=Math.max(0,Math.min(270,e.clientX-start))+'px'}});
+addEventListener('mouseup',()=>{if(down){down=false;document.getElementById('slid').textContent='slider:'+parseInt(knob.style.left)}});
+</script></body></html>`,
+  "/captcha": (cross) => `<!doctype html><html><head><title>Captcha fixture</title></head><body>
+<h1>Captcha fixture</h1>
+<div class="g-recaptcha"><iframe title="reCAPTCHA" src="${cross}/recaptcha/api2/anchor?k=test" width="304" height="78" style="border:0"></iframe>
+<textarea name="g-recaptcha-response" style="display:none"></textarea></div>
+<div id="bwrap" style="visibility:hidden;position:absolute;top:150px;left:20px"><iframe title="recaptcha challenge" src="${cross}/recaptcha/api2/bframe?k=test" width="400" height="300" style="border:0"></iframe></div>
+<script>
+addEventListener('message',(e)=>{ if(e.data==='rc-click'){ if(location.search.includes('challenge')){document.getElementById('bwrap').style.visibility='visible'} else {document.querySelector('textarea').value='TOKEN-OK'} } });
+</script></body></html>`,
+  "/recaptcha/api2/anchor": () => `<!doctype html><html><body style="margin:0;background:#f9f9f9;width:304px;height:78px">
+<div id="cb" role="checkbox" aria-checked="false" aria-label="I'm not a robot" style="position:absolute;left:12px;top:24px;width:30px;height:30px;border:2px solid #555" onclick="this.setAttribute('aria-checked','true');parent.postMessage('rc-click','*')"></div>
+<span style="position:absolute;left:52px;top:30px">I'm not a robot</span></body></html>`,
+  "/recaptcha/api2/bframe": () => `<!doctype html><html><body style="margin:0;background:#fff"><div style="background:#1a73e8;color:#fff;padding:8px">Select all images with <b>traffic lights</b></div><div style="display:grid;grid-template-columns:repeat(3,90px);gap:4px;padding:8px">${Array.from({ length: 9 }, (_, i) => `<div style="height:60px;background:hsl(${i * 40},60%,60%)"></div>`).join("")}</div><button>Verify</button></body></html>`,
   "/products": () => `<!doctype html><html><head><title>Products</title></head><body><main><h1>Products</h1>
     <div class="product"><h2 class="name">Alpha</h2><span class="price">$10.00</span><span class="stock">In stock</span></div>
     <div class="product"><h2 class="name">Beta</h2><span class="price">$25.50</span><span class="stock">Sold out</span></div>
@@ -133,6 +171,11 @@ export async function startFixtureServer(): Promise<FixtureServer> {
     if (path === "/evil-download") {
       res.writeHead(200, { "content-type": "text/plain", "content-disposition": 'attachment; filename="../../evil.txt"' });
       res.end("evil\n");
+      return;
+    }
+    if (path === "/api/data") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ items: [{ id: 1, name: "alpha" }, { id: 2, name: "beta" }], method: req.method }));
       return;
     }
     const page = PAGES[path];

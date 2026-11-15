@@ -6,7 +6,8 @@ import { test } from "node:test";
 
 import { findOrphanChrome, McpServer, OWNER_FILE, parseEnvFile, processInfo, profileInUse } from "../../src/index";
 import { parseKeyCombo } from "../../src/behavior/keyboard";
-import { find_option, installShutdownHandlers, read_session_file, safe_filename, wait_timeout_ms } from "../../src/mcp/server";
+import { find_in_snapshot, find_option, format_bytes, installShutdownHandlers, mime_for, read_session_file, safe_filename, snapshot_diff, wait_timeout_ms } from "../../src/mcp/server";
+import { renderSnapshot } from "../../src/content/snapshot";
 import { CDPClient, runUnguarded } from "../../src/core/cdp-client";
 
 test("initialize negotiates the protocol and advertises tools", async () => {
@@ -685,4 +686,98 @@ test("signal handlers close the browser before exiting; a second signal forces e
   } finally {
     uninstall();
   }
+});
+
+test("new agent tools are advertised with object schemas", async () => {
+  const server = new McpServer();
+  const list = await server.handle({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+  const names = list.result.tools.map((tool: any) => tool.name);
+  for (const name of ["find", "click_at", "drag", "drop_files", "element_info", "network_requests", "response_body", "wait_for_response", "cookies", "save_pdf", "emulate", "solve_captcha", "batch", "browser_status"]) {
+    assert.ok(names.includes(name), `missing tool ${name}`);
+  }
+  const click = list.result.tools.find((tool: any) => tool.name === "click");
+  assert.deepEqual(click.inputSchema.properties.button.enum, ["left", "right", "middle"]);
+  assert.equal(click.inputSchema.properties.doubleClick.type, "boolean");
+});
+
+test("new tools: argument guards before any browser starts", async () => {
+  const server = new McpServer({ allowedDomains: ["example.com"] });
+  const call = async (name: string, args: Record<string, unknown>) => (await server.handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } })).result;
+  for (const [name, args, pattern] of [
+    ["find", {}, /Give text and\/or role/],
+    ["batch", { steps: [] }, /steps is empty/],
+    ["batch", { steps: [{ tool: "batch" }] }, /cannot be nested/],
+    ["batch", { steps: [{ tool: "nope" }] }, /unknown tool "nope"/],
+    ["click_at", { x: 1, y: 1 }, /navigate first/],
+    ["drop_files", { paths: [] }, /navigate first|paths is empty/],
+    ["response_body", { id: "r1" }, /No recorded request r1/],
+    ["wait_for_response", { urlIncludes: "/api", timeout: 0 }, /Timeout after 0s/],
+  ] as Array<[string, Record<string, unknown>, RegExp]>) {
+    const result = await call(name, args);
+    assert.equal(result.isError, true, `${name} should fail`);
+    assert.match(result.content[0].text, pattern, name);
+  }
+  const status = await call("browser_status", {});
+  assert.equal(status.isError, undefined);
+  assert.match(status.content[0].text, /Browser: not started/);
+  await server.close();
+});
+
+test("snapshot_diff: only changed lines, stable refs, full fallback", () => {
+  const before = ['- heading "Inbox" [level=1]', '- button "Compose" [ref=e1]', '- text: "3 unread"', '- link "Mail 1" [ref=e2]', '- link "Mail 2" [ref=e3]', '- link "Mail 3" [ref=e4]', '- link "Mail 4" [ref=e5]', '- link "Mail 5" [ref=e6]'].join("\n");
+  const after = before.replace('- text: "3 unread"', '- text: "2 unread"') + '\n- dialog "New message" [ref=e9]';
+  const diff = snapshot_diff(before, after);
+  assert.match(diff, /^Changes since the last snapshot: \+2 \/ -1 line\(s\)/);
+  assert.match(diff, /\+ - text: "2 unread"/);
+  assert.match(diff, /\+ - dialog "New message" \[ref=e9\]/);
+  assert.match(diff, /- - text: "3 unread"/);
+  assert.doesNotMatch(diff, /Compose/);
+  assert.equal(snapshot_diff(before, before), "(no changes since the last snapshot)");
+  assert.equal(snapshot_diff(undefined, after), after);
+  assert.match(snapshot_diff("- a\n- b", "- c\n- d"), /^\(most of the page changed — full snapshot\)\n- c\n- d$/);
+});
+
+test("find_in_snapshot: text, regex, role, context, ancestors, limit", () => {
+  const snap = ['- main', '  - form "Login"', '    - textbox "Email" [ref=e1]', '    - textbox "Password" [ref=e2]', '    - button "Sign in" [ref=e3]', '  - link "Forgot password?" [ref=e4]', '- button "Sign up" [ref=e5]'].join("\n");
+  let found = find_in_snapshot(snap, { text: "sign in", context: 0 });
+  assert.equal(found.matches, 1);
+  assert.match(found.text, /→     - button "Sign in" \[ref=e3\]/);
+  assert.match(found.text, /^  - main\n    - form "Login"\n…\n→/);
+  found = find_in_snapshot(snap, { role: "button" });
+  assert.equal(found.matches, 2);
+  found = find_in_snapshot(snap, { text: "/^sign (in|up)$/" });
+  assert.equal(found.matches, 0, "regex is tested against the whole line");
+  found = find_in_snapshot(snap, { text: "/\"sign (in|up)\"/" });
+  assert.equal(found.matches, 2);
+  found = find_in_snapshot(snap, { text: "password", role: "textbox", context: 1 });
+  assert.equal(found.matches, 1);
+  assert.match(found.text, /textbox "Email"[\s\S]*→ .*Password[\s\S]*Sign in/);
+  found = find_in_snapshot(snap, { text: "s", limit: 2 });
+  assert.equal(found.shown, 2);
+  assert.ok(found.matches > 2);
+  assert.equal(find_in_snapshot(snap, { text: "ref=e3" }).matches, 0, "refs are not searchable text");
+  assert.throws(() => find_in_snapshot(snap, { text: "/(/" }), /Invalid regex/);
+});
+
+test("renderSnapshot uses the ref allocator (stable refs)", () => {
+  const frames = [{ sessionId: null, targetId: null, hostBackendNodeId: null, nodes: [
+    { nodeId: "1", role: { value: "RootWebArea" }, childIds: ["2", "3"] },
+    { nodeId: "2", role: { value: "button" }, name: { value: "A" }, backendDOMNodeId: 11 },
+    { nodeId: "3", role: { value: "button" }, name: { value: "B" }, backendDOMNodeId: 12 },
+  ] }] as any;
+  const memo = new Map<number, string>([[12, "e7"]]);
+  let next = 40;
+  const { text, refs } = renderSnapshot(frames, { refFor: (_session, backend) => memo.get(backend) ?? `e${++next}` });
+  assert.equal(text, '- button "A" [ref=e41]\n- button "B" [ref=e7]');
+  assert.deepEqual([...refs.keys()].sort(), ["e41", "e7"]);
+  assert.equal(renderSnapshot(frames).text, '- button "A" [ref=e1]\n- button "B" [ref=e2]');
+});
+
+test("format_bytes and mime_for", () => {
+  assert.equal(format_bytes(12), "12 B");
+  assert.equal(format_bytes(2048), "2.0 KB");
+  assert.equal(format_bytes(5 * 1024 * 1024), "5.0 MB");
+  assert.equal(mime_for("C:/x/Photo.JPG"), "image/jpeg");
+  assert.equal(mime_for("/x/clip.mp4"), "video/mp4");
+  assert.equal(mime_for("/x/file.unknown"), "application/octet-stream");
 });

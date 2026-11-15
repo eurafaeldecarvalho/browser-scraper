@@ -49,6 +49,11 @@ export type SnapshotOptions = {
   interactive?: boolean;
   // Truncate long names/text to this many characters (default 120).
   maxTextLength?: number;
+  // Ref for an element (frame session + backend node id). Tabs pass a
+  // memoizing allocator so an element keeps its ref across snapshots (stable
+  // refs make snapshot diffs meaningful and old refs keep working). Default:
+  // e1, e2… in document order.
+  refFor?: (sessionId: string | null, backendNodeId: number) => string;
 };
 
 export type SnapshotResult = {
@@ -156,7 +161,7 @@ export function renderSnapshot(frames: AXFrame[], options: SnapshotOptions = {})
           }
           if ((interactive || role === "Iframe" || role === "iframe") && node.backendDOMNodeId) {
             counter += 1;
-            const ref = `e${counter}`;
+            const ref = options.refFor ? options.refFor(frame.sessionId, node.backendDOMNodeId) : `e${counter}`;
             refs.set(ref, {
               backendNodeId: node.backendDOMNodeId,
               sessionId: frame.sessionId,
