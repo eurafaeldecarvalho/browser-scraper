@@ -1,13 +1,14 @@
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, resolve as resolve_path } from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { Browser, type BrowserOptions } from "../core/browser";
 import { CDPClient } from "../core/cdp-client";
 import type { Element } from "../core/element";
-import type { Dialog, Tab } from "../core/tab";
+import { Dialog, type Tab } from "../core/tab";
 import { scrape, type ScrapeFormat } from "../scrape";
 
 // A dependency-free Model Context Protocol server (JSON-RPC 2.0 over stdio,
@@ -127,6 +128,11 @@ export class McpServer {
   private _browser_setup = false;
   private _downloads_error: string | null = null;
   private _tools: ToolDef[];
+  // Bumped when a call times out: the abandoned call keeps running in the
+  // background and must not change the current tab or relaunch the browser
+  // under the calls that come after it.
+  private _generation = 0;
+  private _call_generation = new AsyncLocalStorage<number>();
   private _out: NodeJS.WritableStream;
 
   constructor(options: McpServerOptions = {}) {
@@ -208,14 +214,21 @@ export class McpServer {
   private async _run_tool(tool: ToolDef, args: Record<string, any>): Promise<ToolResult> {
     const limit = this._options.toolTimeoutMs ?? LONG_TOOL_TIMEOUT_MS[tool.name] ?? TOOL_TIMEOUT_MS;
     let timer: NodeJS.Timeout | undefined;
+    const timed_out = new Error(`${tool.name} did not finish within ${Math.round(limit / 1_000)}s (the page may be frozen). Try snapshot, reload or close_tab.`);
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${tool.name} did not finish within ${Math.round(limit / 1_000)}s (the page may be frozen). Try snapshot, reload or close_tab.`)), limit);
+      timer = setTimeout(() => reject(timed_out), limit);
       timer.unref?.();
     });
+    const generation = this._generation;
+    const call = this._call_generation.run(generation, () => this._run_tool_inner(tool, args));
+    void call.catch(() => undefined);
     try {
-      return await Promise.race([this._run_tool_inner(tool, args), timeout]);
+      return await Promise.race([call, timeout]);
     } catch (error) {
-      if (/did not finish within/.test(String((error as Error)?.message ?? error))) {
+      // Identity, not message text: a page error quoting the phrase must not
+      // tear down the tab's connection.
+      if (error === timed_out) {
+        this._generation++;
         await this._abandon_current_tab();
       }
       throw error;
@@ -235,6 +248,9 @@ export class McpServer {
       return;
     }
     const target_id = tab.target_id;
+    // A dialog that is still showing stays pending (the page is frozen behind
+    // it), re-bound to the fresh connection so handle_dialog can answer it.
+    const pending = this._pending_dialogs.get(target_id);
     this._pending_dialogs.delete(target_id);
     this._wired.delete(target_id);
     this._tab = null;
@@ -242,9 +258,24 @@ export class McpServer {
     try {
       const fresh = await browser.attachTab(target_id);
       this._wire(fresh);
+      if (pending) {
+        this._pending_dialogs.set(target_id, { ...pending, dialog: new Dialog(fresh.cdp, { type: pending.type, message: pending.message, defaultPrompt: pending.defaultPrompt }) });
+      }
       this._tab = fresh;
     } catch {
       // The page is gone or unreachable: the next call says so.
+    }
+  }
+
+  // True inside a call that timed out and was abandoned.
+  private _stale(): boolean {
+    const generation = this._call_generation.getStore();
+    return generation !== undefined && generation !== this._generation;
+  }
+
+  private _assert_current(): void {
+    if (this._stale()) {
+      throw new Error("This call timed out and was abandoned.");
     }
   }
 
@@ -255,7 +286,7 @@ export class McpServer {
     try {
       return await tool.run(args);
     } catch (error) {
-      if (tool.name === "close_browser" || !this._browser?.launched) {
+      if (tool.name === "close_browser" || !this._browser?.launched || this._stale()) {
         throw error;
       }
       const message = String((error as Error)?.message ?? error);
@@ -279,6 +310,7 @@ export class McpServer {
   }
 
   private async _relaunch_notice(): Promise<void> {
+    this._assert_current();
     await this.close();
     this._note("The browser had been closed or crashed; it was relaunched on the same profile (cookies kept). Pages that were open are gone — navigate again if needed.");
   }
@@ -405,7 +437,13 @@ export class McpServer {
     const max = this._options.maxOutputChars ?? 40_000;
     const clipped = text.length > max ? `${text.slice(0, max)}\n… [truncated ${text.length - max} chars — use markdown with a query to narrow it]` : text;
     // Neutralize a fake closing marker planted in the page.
-    const safe = clipped.replace(/<\/?untrusted-page-content>/gi, "");
+    // Repeat until stable: removing one marker must not join the halves of a
+    // nested one ("<untrusted-<untrusted-page-content>page-content>").
+    let safe = clipped;
+    for (let previous = ""; previous !== safe; ) {
+      previous = safe;
+      safe = safe.replace(/<\s*\/?\s*untrusted-page-content\b[^>]*>/gi, "");
+    }
     return `<untrusted-page-content>\n${safe}\n</untrusted-page-content>`;
   }
 
@@ -467,12 +505,14 @@ export class McpServer {
   }
 
   private _record_download(p: Record<string, any>): void {
-    // Hours of downloads: keep the unreported ones and the latest reported.
-    if (this._downloads.length >= MAX_DOWNLOAD_ENTRIES) {
-      const index = this._downloads.findIndex((download) => download.reported);
-      if (index >= 0) {
-        this._downloads.splice(index, 1);
+    // Hours of downloads: drop reported ones first, then finished ones, then
+    // the oldest — a page firing hundreds of downloads must not grow memory.
+    while (this._downloads.length >= MAX_DOWNLOAD_ENTRIES) {
+      let index = this._downloads.findIndex((download) => download.reported);
+      if (index < 0) {
+        index = this._downloads.findIndex((download) => download.state !== "inProgress");
       }
+      this._downloads.splice(Math.max(0, index), 1);
     }
     this._downloads.push({ guid: String(p.guid), url: String(p.url ?? ""), suggestedFilename: String(p.suggestedFilename ?? "download"), state: "inProgress", path: null, reported: false, noted: false });
   }
@@ -593,8 +633,11 @@ export class McpServer {
 
   private async _get_tab(): Promise<Tab> {
     if (!this._tab) {
+      this._assert_current();
       const browser = await this._launched_browser();
-      this._tab = await browser.newTab();
+      const tab = await browser.newTab();
+      this._assert_current();
+      this._tab = tab;
       this._tab_id_for(this._tab.target_id);
       this._wire(this._tab);
     }
@@ -664,6 +707,7 @@ export class McpServer {
   private async _activate(target_id: string): Promise<Tab> {
     const browser = await this._launched_browser();
     const tab = await browser.attachTab(target_id);
+    this._assert_current();
     this._wire(tab);
     this._tab = tab;
     if (this._options.browserOptions?.headless === false) {
@@ -1064,6 +1108,52 @@ export class McpServer {
     }
   }
 
+  // DOMStorage only reaches origins that have a frame in the session's own
+  // page ("Frame not found for the given storage id" otherwise). Runs `fn` on
+  // an open tab of `origin`, or on a throwaway tab whose document for that
+  // origin is served locally (Fetch interception: no request reaches the site).
+  private async _with_origin_tab<T>(origin: string, fn: (tab: Tab) => Promise<T>): Promise<T> {
+    const browser = await this._launched_browser();
+    for (const page of await this._list_pages()) {
+      let page_origin = "";
+      try {
+        page_origin = new URL(page.url).origin;
+      } catch {
+        continue;
+      }
+      if (page_origin === origin && !this._pending_dialogs.has(page.targetId)) {
+        return fn(await browser.attachTab(page.targetId));
+      }
+    }
+    const temp = await browser.newTab();
+    this._seen_targets.add(temp.target_id);
+    this._startup_targets.add(temp.target_id);
+    const on_paused = (params: Record<string, any>): void => {
+      const same = (() => {
+        try {
+          return new URL(String(params.request?.url)).origin === origin && params.resourceType === "Document";
+        } catch {
+          return false;
+        }
+      })();
+      void (same
+        ? temp.cdp.send("Fetch.fulfillRequest", { requestId: params.requestId, responseCode: 200, responseHeaders: [{ name: "Content-Type", value: "text/html" }], body: Buffer.from("<!doctype html><title></title>").toString("base64") })
+        : temp.cdp.send("Fetch.failRequest", { requestId: params.requestId, errorReason: "BlockedByClient" })
+      ).catch(() => undefined);
+    };
+    try {
+      temp.cdp.on("Fetch.requestPaused", on_paused as (params: unknown) => void);
+      await temp.cdp.send("Fetch.enable", { patterns: [{ urlPattern: "*", requestStage: "Request" }] });
+      await temp.goto({ url: `${origin}/`, waitUntil: "load", timeout: 15_000 });
+      return await fn(temp);
+    } finally {
+      temp.cdp.off("Fetch.requestPaused", on_paused as (params: unknown) => void);
+      await browser.closeTab(temp).catch(() => undefined);
+      this._startup_targets.delete(temp.target_id);
+      this._seen_targets.delete(temp.target_id);
+    }
+  }
+
   private async _read_local_storage(tab: Tab, origin: string): Promise<Record<string, string> | null> {
     try {
       await tab.cdp.send("DOMStorage.enable");
@@ -1181,6 +1271,7 @@ export class McpServer {
           const tab = await browser.newTab();
           this._tab_id_for(tab.target_id);
           this._wire(tab);
+          this._assert_current();
           this._tab = tab;
           if (this._options.browserOptions?.headless === false) {
             await tab.bringToFront().catch(() => undefined);
@@ -1250,6 +1341,7 @@ export class McpServer {
           }
           const tab = await browser.attachTab(page.targetId);
           const was_current = this._tab?.target_id === page.targetId;
+          this._assert_current();
           await browser.closeTab(tab);
           this._tab_ids.delete(page.id);
           this._forget_target(page.targetId);
@@ -1535,7 +1627,9 @@ export class McpServer {
             throw new Error("Give ref or selector.");
           }
           await element.scrollIntoView();
-          await element.hover();
+          if (await this._act(tab, () => element.hover())) {
+            return text(await this._page_state(tab));
+          }
           await tab.sleep({ milliseconds: 500 });
           await this._enforce_location(tab);
           return text(await this._page_state(tab));
@@ -1555,7 +1649,11 @@ export class McpServer {
           if (args.label === undefined && args.value === undefined) {
             throw new Error("Give label or value.");
           }
-          const chosen = await this._select_option(tab, String(args.ref), args.label !== undefined ? String(args.label) : undefined, args.value !== undefined ? String(args.value) : undefined);
+          let chosen = "";
+          // A dialog opened by the click (manual mode) returns control.
+          if (await this._act(tab, async () => { chosen = await this._select_option(tab, String(args.ref), args.label !== undefined ? String(args.label) : undefined, args.value !== undefined ? String(args.value) : undefined); })) {
+            return text(await this._page_state(tab));
+          }
           await this._enforce_location(tab);
           return text(`Selected: ${chosen}\n\n${await this._page_state(tab)}`);
         },
@@ -1566,7 +1664,10 @@ export class McpServer {
         inputSchema: { type: "object", properties: { ref: ref_schema, checked: { type: "boolean", default: true } }, required: ["ref"] },
         run: async (args) => {
           const tab = await this._ready_tab();
-          const state = await this._set_checked(tab, String(args.ref), args.checked ?? true);
+          let state = false;
+          if (await this._act(tab, async () => { state = await this._set_checked(tab, String(args.ref), args.checked ?? true); })) {
+            return text(await this._page_state(tab));
+          }
           await this._enforce_location(tab);
           return text(`checked: ${state}\n\n${await this._page_state(tab)}`);
         },
@@ -1577,7 +1678,8 @@ export class McpServer {
         inputSchema: { type: "object", properties: { ref: ref_schema }, required: ["ref"] },
         run: async (args) => {
           const tab = await this._ready_tab();
-          await this._clear(await this._element(tab, args.ref));
+          const element = await this._element(tab, args.ref);
+          await this._act(tab, () => this._clear(element));
           return text(await this._page_state(tab));
         },
       },
@@ -1607,8 +1709,13 @@ export class McpServer {
             throw new Error("fields is empty.");
           }
           const done: string[] = [];
-          let last_text: Element | null = null;
+          let last_text = null as Element | null;
+          let stopped = false;
+          const fill = async (): Promise<void> => {
           for (const field of fields) {
+            if (stopped) {
+              return;
+            }
             const ref = String(field.ref);
             const role = tab.describeRef({ ref })?.role ?? "";
             const element = await this._element(tab, ref);
@@ -1628,6 +1735,14 @@ export class McpServer {
               done.push(`${ref}: typed ${value.length} chars`);
             }
             await tab.sleep({ milliseconds: 250 });
+          }
+          };
+          // A dialog opened by a field (manual mode) returns control with what
+          // was filled so far.
+          if (await this._act(tab, fill)) {
+            // Do not keep filling behind the agent's back once it answers.
+            stopped = true;
+            return text(`${done.join("\n")}\nStopped: a dialog opened.\n\n${await this._page_state(tab)}`);
           }
           if (args.submit && !last_text) {
             done.push("submit ignored: no text field to press Enter in — click the submit button instead.");
@@ -1668,7 +1783,10 @@ export class McpServer {
               throw new Error(`File not found: ${path}`);
             }
           }
-          const how = await this._upload(tab, String(args.ref), paths);
+          let how = "";
+          if (await this._act(tab, async () => { how = await this._upload(tab, String(args.ref), paths); })) {
+            return text(await this._page_state(tab));
+          }
           await tab.sleep({ milliseconds: 500 });
           await this._enforce_location(tab);
           return text(`Attached ${paths.map((path) => basename(path)).join(", ")} (${how}).\n\n${await this._page_state(tab)}`);
@@ -1734,7 +1852,11 @@ export class McpServer {
         },
         run: async (args) => {
           const tab = await this._ready_tab();
-          const value = await tab.evaluate({ expression: String(args.expression), world: args.world === "main" ? "main" : "isolated" });
+          let value: unknown;
+          // alert() in the expression (manual mode) would block until timeout.
+          if (await this._act(tab, async () => { value = await tab.evaluate({ expression: String(args.expression), world: args.world === "main" ? "main" : "isolated" }); })) {
+            return text(await this._page_state(tab));
+          }
           // The expression may have navigated (location.href = …).
           await this._enforce_location(tab);
           return text(this._untrusted(value === undefined ? "undefined" : JSON.stringify(value, null, 2)));
@@ -1748,14 +1870,19 @@ export class McpServer {
         run: async (args) => {
           const tab = await this._ready_tab();
           const value = this._fill_secrets(String(args.text));
-          let session: string | null = null;
-          if (args.ref) {
-            const element = await this._element(tab, args.ref);
-            await element.click();
-            session = element.sessionId;
-            await tab.sleep({ milliseconds: 200 });
+          const paste = async (): Promise<void> => {
+            let session: string | null = null;
+            if (args.ref) {
+              const element = await this._element(tab, args.ref);
+              await element.click();
+              session = element.sessionId;
+              await tab.sleep({ milliseconds: 200 });
+            }
+            await this._paste(tab, value, session);
+          };
+          if (await this._act(tab, paste)) {
+            return text(await this._page_state(tab));
           }
-          await this._paste(tab, value, session);
           await tab.sleep({ milliseconds: 300 });
           await this._enforce_location(tab);
           return text(await this._page_state(tab));
@@ -1813,15 +1940,16 @@ export class McpServer {
             if (entry) {
               entry.reported = true;
               if (entry.state === "canceled") {
-                return { content: [{ type: "text", text: `Download canceled: ${entry.suggestedFilename} (${entry.url})` }], isError: true };
+                // File name and URL come from the site.
+                return { content: [{ type: "text", text: `Download canceled: ${this._untrusted(`${entry.suggestedFilename} (${entry.url})`)}` }], isError: true };
               }
               const size = entry.path && existsSync(entry.path) ? statSync(entry.path).size : 0;
-              return text(`Downloaded: ${entry.path}\nFile: ${basename(entry.path ?? "")}\nSize: ${size} bytes\nFrom: ${entry.url}`);
+              return text(`Downloaded (${size} bytes):\n${this._untrusted(`Path: ${entry.path}\nFile: ${basename(entry.path ?? "")}\nFrom: ${entry.url}`)}`);
             }
             await delay(250);
           }
           const running = this._downloads.filter((download) => download.state === "inProgress");
-          throw new Error(running.length ? `Timeout: ${running.length} download(s) still in progress (${running.map((download) => download.suggestedFilename).join(", ")}).` : "Timeout: no download started. Click the download link/button first.");
+          throw new Error(running.length ? `Timeout: ${running.length} download(s) still in progress: ${this._untrusted(running.map((download) => download.suggestedFilename).join(", "))}` : "Timeout: no download started. Click the download link/button first.");
         },
       },
       {
@@ -1849,7 +1977,7 @@ export class McpServer {
       {
         name: "export_session",
         description:
-          "Back up the login session to a JSON file: cookies (all, or only for `domains`) and the localStorage of the open tabs' origins. Values are written to the file only, never returned. Restore with import_session.",
+          "Back up the login session to a JSON file: cookies (only for `domains`; default: every site, or the --allowed-domains when set) and the localStorage of the open tabs' origins. Values are written to the file only, never returned. Restore with import_session.",
         inputSchema: {
           type: "object",
           properties: { path: { type: "string", description: "Absolute path of the JSON file to write." }, domains: { type: "array", items: { type: "string" }, description: "e.g. [\"example.com\"] (subdomains included)." } },
@@ -1873,7 +2001,8 @@ export class McpServer {
             if (!/^https?:/.test(origin) || origins[origin] || !keep(new URL(origin).hostname)) {
               continue;
             }
-            const items = await this._read_local_storage(tab, origin);
+            // Read through that page's own connection (see _with_origin_tab).
+            const items = this._pending_dialogs.has(page.targetId) ? null : await this._read_local_storage(await this._ensure_browser().attachTab(page.targetId), origin);
             if (items && Object.keys(items).length > 0) {
               origins[origin] = { localStorage: items };
             }
@@ -1882,7 +2011,9 @@ export class McpServer {
           // mid-write never leaves a truncated session, and the 0600 mode
           // applies even when replacing an older export.
           const temp = `${path}.${process.pid}.tmp`;
-          writeFileSync(temp, JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), cookies, origins }, null, 2), { mode: 0o600 });
+          // Never follow or reuse a file planted under the temp name.
+          rmSync(temp, { force: true });
+          writeFileSync(temp, JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), cookies, origins }, null, 2), { mode: 0o600, flag: "wx" });
           try {
             chmodSync(temp, 0o600);
             renameSync(temp, path);
@@ -1914,13 +2045,29 @@ export class McpServer {
             await tab.cdp.send("Network.setCookies", { cookies });
           }
           let items = 0;
+          const failed: string[] = [];
           for (const [origin, entry] of storage) {
-            for (const [key, value] of Object.entries(entry.localStorage ?? {})) {
-              await tab.cdp.send("DOMStorage.setDOMStorageItem", { storageId: { securityOrigin: origin, isLocalStorage: true }, key, value: String(value) });
-              items++;
+            const pairs = Object.entries(entry.localStorage ?? {});
+            if (pairs.length === 0) {
+              continue;
+            }
+            try {
+              await this._with_origin_tab(origin, async (target) => {
+                await target.cdp.send("DOMStorage.enable");
+                try {
+                  for (const [key, value] of pairs) {
+                    await target.cdp.send("DOMStorage.setDOMStorageItem", { storageId: { securityOrigin: origin, isLocalStorage: true }, key, value: String(value) });
+                    items++;
+                  }
+                } finally {
+                  await target.cdp.send("DOMStorage.disable").catch(() => undefined);
+                }
+              });
+            } catch (error) {
+              failed.push(`${origin} (${String((error as Error)?.message ?? error)})`);
             }
           }
-          return text(`Restored ${cookies.length} cookies and ${items} localStorage item(s).${skipped ? ` Skipped ${skipped} cookie(s)/origin(s) outside the allowed domains.` : ""}`);
+          return text(`Restored ${cookies.length} cookies and ${items} localStorage item(s).${skipped ? ` Skipped ${skipped} cookie(s)/origin(s) outside the allowed domains.` : ""}${failed.length ? ` localStorage NOT restored for: ${failed.join("; ")}.` : ""}`);
         },
       },
       {
@@ -1929,6 +2076,7 @@ export class McpServer {
         inputSchema: { type: "object", properties: {} },
         annotations: { destructiveHint: true },
         run: async () => {
+          this._assert_current();
           const was_open = Boolean(this._browser?.launched);
           await this.close();
           return text(was_open ? "Browser closed." : "The browser was not running.");

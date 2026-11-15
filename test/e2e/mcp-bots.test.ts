@@ -171,7 +171,7 @@ describe("mcp bot tools over stdio (e2e)", { skip: chrome ? false : "Chrome not 
     out = await tool("click", { ref: ref(out.text, /link "Download report" \[ref=(e\d+)\]/) });
     out = await tool("wait_for_download", { timeout: 20 });
     assert.equal(out.isError, false, out.text);
-    const file = out.text.match(/Downloaded: (.+)/)?.[1].trim() ?? "";
+    const file = out.text.match(/Path: (.+)/)?.[1].trim() ?? "";
     assert.match(file, /report\.txt$/);
     assert.equal(readFileSync(file, "utf8"), "quarterly report\n");
 
@@ -204,6 +204,28 @@ describe("mcp bot tools over stdio (e2e)", { skip: chrome ? false : "Chrome not 
     assert.match((await tool("import_session", { path: session_file })).text, /Restored [1-9]\d* cookies and 1 localStorage/);
     out = await tool("evaluate", { expression: "document.cookie + '|' + localStorage.getItem('session_token')" });
     assert.match(out.text, /sid=abc123.*\|tok-123/);
+
+    // localStorage of an origin no tab has open is restored too (DOMStorage
+    // needs a frame of that origin), and export reads every open tab's origin.
+    const other_origin = server.origin.replace("127.0.0.1", "localhost");
+    const other_file = join(work, "other-origin.json");
+    writeFileSync(other_file, JSON.stringify({ version: 1, cookies: [], origins: { [other_origin]: { localStorage: { other_key: "other-value" } } } }));
+    out = await tool("import_session", { path: other_file });
+    assert.match(out.text, /Restored 0 cookies and 1 localStorage/);
+    assert.doesNotMatch(out.text, /NOT restored/);
+    assert.doesNotMatch((await tool("list_tabs")).text, /localhost/);
+    out = await tool("new_tab", { url: `${other_origin}/` });
+    const other_tab = out.text.match(/Tab: (t\d+)/)?.[1] ?? "";
+    assert.match((await tool("evaluate", { expression: "localStorage.getItem('other_key')" })).text, /other-value/);
+    await tool("switch_tab", { id: "t1" });
+    out = await tool("export_session", { path: session_file });
+    assert.match(out.text, /localStorage of 2 origin/);
+    await tool("close_tab", { id: other_tab });
+
+    // manual dialogs: evaluate that opens alert() returns at once instead of timing out
+    out = await tool("evaluate", { expression: "setTimeout(() => 0); alert('from evaluate'); 1", world: "main" });
+    assert.match(out.text, /An? alert dialog is open/);
+    assert.match((await tool("handle_dialog", { accept: true })).text, /Accepted alert/);
 
     // a second Chrome on the same profile gets a clear error
     const intruder = new Browser({ chromePath: chrome, headless: true, userDataDir: profile, warnOnDirectEgress: false });
@@ -289,7 +311,7 @@ describe("mcp red team over stdio (e2e)", { skip: chrome ? false : "Chrome not f
     await tool("click", { ref: ref(page, /link "Evil download" \[ref=(e\d+)\]/) });
     out = await tool("wait_for_download", { timeout: 20 });
     assert.equal(out.isError, false, out.text);
-    const file = out.text.match(/Downloaded: (.+)/)?.[1].trim() ?? "";
+    const file = out.text.match(/Path: (.+)/)?.[1].trim() ?? "";
     assert.equal(dirname(file), join(work, "downloads"));
     assert.equal(readFileSync(file, "utf8"), "evil\n");
 

@@ -18,6 +18,7 @@ All notable changes to this project are documented here. The format follows [Kee
 - `element.screenshot()` of an element inside an out-of-process iframe captured the wrong area.
 - `browser.checkEgress()` left its lookup tab open (it only dropped the CDP connection).
 - `tab.waitForNetworkIdle()` no longer waits forever on a request that never gets a response.
+- MCP `import_session` restores localStorage for origins no tab has open (DOMStorage needs a frame of the origin); `export_session` reads the localStorage of every open tab, not only the current one.
 
 ## [0.8.3] — 2026-10-27
 
