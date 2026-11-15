@@ -3,7 +3,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { Keyboard } from "../behavior/keyboard";
 import { getSharedMouse } from "../behavior/mouse";
-import { CDPClient } from "./cdp-client";
+import { CDPClient, runUnguarded } from "./cdp-client";
 
 export class Element {
   private _cdp: CDPClient;
@@ -236,13 +236,18 @@ export class Element {
       clickCount: 1,
     });
 
-    await this._cdp.send("Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      x,
-      y,
-      button: "left",
-      clickCount: 1,
-    });
+    // Release is cleanup of the press: it must go out even if the call was
+    // abandoned meanwhile (a mousedown handler opened a dialog), or the page
+    // is left with the button held down.
+    await runUnguarded(() =>
+      this._cdp.send("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x,
+        y,
+        button: "left",
+        clickCount: 1,
+      }),
+    );
   }
 
   private async _click_normal(human_like = true): Promise<void> {
@@ -274,13 +279,18 @@ export class Element {
       clickCount: 1,
     });
 
-    await this._cdp.send("Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      x,
-      y,
-      button: "left",
-      clickCount: 1,
-    });
+    // Release is cleanup of the press: it must go out even if the call was
+    // abandoned meanwhile (a mousedown handler opened a dialog), or the page
+    // is left with the button held down.
+    await runUnguarded(() =>
+      this._cdp.send("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x,
+        y,
+        button: "left",
+        clickCount: 1,
+      }),
+    );
   }
 
   async type({

@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
-import { CDPClient } from "../core/cdp-client";
+import { CDPClient, runUnguarded } from "../core/cdp-client";
 import { getSharedMouse } from "./mouse";
 
 type KeyDescriptor = {
@@ -200,27 +200,25 @@ export class Keyboard {
   // then the modifiers come up in reverse order.
   private async _press_combo(modifiers: string[], key: string): Promise<void> {
     let mask = 0;
-    for (const modifier of modifiers) {
-      mask |= MODIFIER_BITS[modifier];
-      const descriptor = NAMED_KEYS[modifier];
-      await this._cdp.send(
-        "Input.dispatchKeyEvent",
-        { type: "rawKeyDown", key: descriptor.key, code: descriptor.code, windowsVirtualKeyCode: descriptor.keyCode, nativeVirtualKeyCode: descriptor.keyCode, modifiers: mask },
-        this._session_id,
-      );
-      await delay(random_between(30, 70));
-    }
+    const held: string[] = [];
+    const send_key = (params: Record<string, unknown>) => this._cdp.send("Input.dispatchKeyEvent", params, this._session_id);
+    try {
+      for (const modifier of modifiers) {
+        const descriptor = NAMED_KEYS[modifier];
+        await send_key({ type: "rawKeyDown", key: descriptor.key, code: descriptor.code, windowsVirtualKeyCode: descriptor.keyCode, nativeVirtualKeyCode: descriptor.keyCode, modifiers: mask | MODIFIER_BITS[modifier] });
+        mask |= MODIFIER_BITS[modifier];
+        held.push(modifier);
+        await delay(random_between(30, 70));
+      }
 
-    // Letters follow the Shift state ("Control+A" is Ctrl + the a key, like a person presses it).
-    const letter = /^[a-z]$/i.test(key) ? (mask & MODIFIER_BITS.Shift ? key.toUpperCase() : key.toLowerCase()) : key;
-    const descriptor = deriveKey(letter);
-    // With Ctrl/Alt/Meta held the key produces no text (Ctrl+A selects, it
-    // doesn't type "a"); Shift alone still types the shifted character.
-    const produces_text = Boolean(descriptor.text) && (mask & ~MODIFIER_BITS.Shift) === 0;
-    const commands = process.platform === "darwin" ? mac_editing_commands(mask, descriptor.key) : [];
-    await this._cdp.send(
-      "Input.dispatchKeyEvent",
-      {
+      // Letters follow the Shift state ("Control+A" is Ctrl + the a key, like a person presses it).
+      const letter = /^[a-z]$/i.test(key) ? (mask & MODIFIER_BITS.Shift ? key.toUpperCase() : key.toLowerCase()) : key;
+      const descriptor = deriveKey(letter);
+      // With Ctrl/Alt/Meta held the key produces no text (Ctrl+A selects, it
+      // doesn't type "a"); Shift alone still types the shifted character.
+      const produces_text = Boolean(descriptor.text) && (mask & ~MODIFIER_BITS.Shift) === 0;
+      const commands = process.platform === "darwin" ? mac_editing_commands(mask, descriptor.key) : [];
+      await send_key({
         type: produces_text ? "keyDown" : "rawKeyDown",
         key: descriptor.key,
         code: descriptor.code,
@@ -229,32 +227,33 @@ export class Keyboard {
         modifiers: mask,
         ...(produces_text ? { text: descriptor.text, unmodifiedText: descriptor.text } : {}),
         ...(commands.length > 0 ? { commands } : {}),
-      },
-      this._session_id,
-    );
-    await delay(random_between(20, 60));
-    await this._cdp.send(
-      "Input.dispatchKeyEvent",
-      { type: "keyUp", key: descriptor.key, code: descriptor.code, windowsVirtualKeyCode: descriptor.keyCode, nativeVirtualKeyCode: descriptor.keyCode, modifiers: mask },
-      this._session_id,
-    );
-
-    for (const modifier of [...modifiers].reverse()) {
-      await delay(random_between(20, 50));
-      mask &= ~MODIFIER_BITS[modifier];
-      const modifier_descriptor = NAMED_KEYS[modifier];
-      await this._cdp.send(
-        "Input.dispatchKeyEvent",
-        { type: "keyUp", key: modifier_descriptor.key, code: modifier_descriptor.code, windowsVirtualKeyCode: modifier_descriptor.keyCode, nativeVirtualKeyCode: modifier_descriptor.keyCode, modifiers: mask },
-        this._session_id,
-      );
+      });
+      await delay(random_between(20, 60));
+      const key_mask = mask;
+      // Cleanup of the press: sent even if the call was abandoned meanwhile.
+      await runUnguarded(() => send_key({ type: "keyUp", key: descriptor.key, code: descriptor.code, windowsVirtualKeyCode: descriptor.keyCode, nativeVirtualKeyCode: descriptor.keyCode, modifiers: key_mask }));
+    } finally {
+      // Every modifier that went down comes up, even if the combo failed or
+      // the call was abandoned (a keydown handler opened a dialog): a stuck
+      // Control would turn the page's next clicks into Ctrl+clicks.
+      for (const modifier of [...held].reverse()) {
+        await delay(random_between(20, 50));
+        mask &= ~MODIFIER_BITS[modifier];
+        const modifier_descriptor = NAMED_KEYS[modifier];
+        const release_mask = mask;
+        await runUnguarded(() =>
+          send_key({ type: "keyUp", key: modifier_descriptor.key, code: modifier_descriptor.code, windowsVirtualKeyCode: modifier_descriptor.keyCode, nativeVirtualKeyCode: modifier_descriptor.keyCode, modifiers: release_mask }),
+        ).catch(() => undefined);
+      }
     }
   }
 
   private async _press(key: string): Promise<void> {
     await this.down(key);
     await delay(random_between(20, 60));
-    await this.up(key);
+    // Cleanup of the press: sent even if the call was abandoned meanwhile (a
+    // keydown handler opened a dialog), or the page sees the key held forever.
+    await runUnguarded(() => this.up(key));
   }
 
   async down(key: string): Promise<void> {
@@ -334,15 +333,22 @@ export class Keyboard {
       await this.down(char);
       await delay(dwell);
 
+      // Key-ups are cleanup of their key-downs: sent even if the call was
+      // abandoned meanwhile, so no key is left held down on the page.
       if (can_roll) {
         // Overlap: begin the next key before lifting the current one.
-        await this.down(next);
-        await this.up(char);
+        try {
+          await this.down(next);
+        } catch (error) {
+          await runUnguarded(() => this.up(char)).catch(() => undefined);
+          throw error;
+        }
+        await runUnguarded(() => this.up(char));
         await delay(lognormal_ms(45, 0.5, 15, 120));
-        await this.up(next);
+        await runUnguarded(() => this.up(next));
         index += 1; // consumed `next`
       } else {
-        await this.up(char);
+        await runUnguarded(() => this.up(char));
       }
 
       let flight = lognormal_ms(110, 0.45, 40, 260);

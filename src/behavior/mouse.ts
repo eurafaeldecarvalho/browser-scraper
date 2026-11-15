@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 
-import { CDPClient } from "../core/cdp-client";
+import { CDPClient, runUnguarded } from "../core/cdp-client";
 
 export function bezierPoint({ t, points }: { t: number; points: Array<[number, number]> }): [number, number] {
   const n = points.length - 1;
@@ -237,14 +237,17 @@ export class HumanMouse {
 
     await delay(random_between(40, 110));
 
-    await this._cdp.send("Input.dispatchMouseEvent", {
-      type: "mouseReleased",
-      x: cx,
-      y: cy,
-      button,
-      buttons: 0,
-      clickCount,
-    });
+    // Cleanup of the press: sent even if the call was abandoned meanwhile.
+    await runUnguarded(() =>
+      this._cdp.send("Input.dispatchMouseEvent", {
+        type: "mouseReleased",
+        x: cx,
+        y: cy,
+        button,
+        buttons: 0,
+        clickCount,
+      }),
+    );
   }
 
   async scroll({
