@@ -621,6 +621,8 @@ export class McpServer {
 
   private _untrusted(text: string): string {
     const max = this._options.maxOutputChars ?? 40_000;
+    // Redact before clipping: a secret cut at the boundary would leak its prefix.
+    text = this._redact(text);
     const clipped = text.length > max ? `${text.slice(0, max)}\n… [truncated ${text.length - max} chars — use markdown with a query to narrow it]` : text;
     // Neutralize a fake closing marker planted in the page.
     // Repeat until stable: removing one marker must not join the halves of a
@@ -774,7 +776,7 @@ export class McpServer {
     });
     tab.onDialog(async (dialog) => {
       const id = this._tab_id_for(tab.target_id);
-      const label = `${dialog.type} "${dialog.message.slice(0, 300)}"`;
+      const label = `${dialog.type} "${this._clip_redacted(dialog.message, 300)}"`;
       if (policy === "manual") {
         this._pending_dialogs.set(tab.target_id, { dialog, type: dialog.type, message: dialog.message, defaultPrompt: dialog.defaultPrompt });
         for (const waiter of this._dialog_waiters) {
@@ -799,7 +801,7 @@ export class McpServer {
     const tab = await this._require_tab();
     const pending = this._pending_dialogs.get(tab.target_id);
     if (pending) {
-      throw new Error(`A ${pending.type} dialog is open on this tab: ${this._untrusted(pending.message.slice(0, 300))}\nAnswer it with handle_dialog first.`);
+      throw new Error(`A ${pending.type} dialog is open on this tab: ${this._untrusted(this._clip_redacted(pending.message, 300))}\nAnswer it with handle_dialog first.`);
     }
     return tab;
   }
@@ -995,7 +997,7 @@ export class McpServer {
     if (mode === "none") {
       return "(snapshot omitted — call snapshot, or find to look up elements by text/role)";
     }
-    const snap = await tab.snapshot({ interactive: Boolean(options.interactive) });
+    const snap = await tab.snapshot({ interactive: Boolean(options.interactive), redact: (t) => this._redact(t) });
     // Diffs only compare like with like: an interactive-only list is not a base,
     // and neither is a snapshot of a document that was navigated away from (its
     // refs are gone, and identical lines would read as "no changes").
@@ -1403,13 +1405,13 @@ export class McpServer {
     const want = String(label ?? value);
     await element.click();
     await tab.sleep({ milliseconds: 600 });
-    let option = find_option(await tab.snapshot(), want);
+    let option = find_option(await tab.snapshot({ redact: (t) => this._redact(t) }), want);
     const editable = await element.callFunction({ fn: "function() { return this.isContentEditable || ((this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) && !this.readOnly); }" });
     if (!option && editable) {
       // Autocomplete combobox: type to filter, then pick.
       await element.type({ text: want, clear: true });
       await tab.sleep({ milliseconds: 900 });
-      option = find_option(await tab.snapshot(), want);
+      option = find_option(await tab.snapshot({ redact: (t) => this._redact(t) }), want);
     }
     if (!option) {
       throw new Error(`No option matching "${want}" appeared after opening ${ref}. Take a snapshot to see the list and click the option directly.`);
@@ -2747,7 +2749,7 @@ export class McpServer {
           }
           const tab = await this._ready_tab();
           // Not a diff base: the agent sees only the matches, not this outline.
-          const snap = await tab.snapshot();
+          const snap = await tab.snapshot({ redact: (t) => this._redact(t) });
           const found = find_in_snapshot(snap, {
             text: args.text !== undefined ? String(args.text) : undefined,
             role: args.role !== undefined ? String(args.role) : undefined,

@@ -54,6 +54,10 @@ export type SnapshotOptions = {
   // refs make snapshot diffs meaningful and old refs keep working). Default:
   // e1, e2… in document order.
   refFor?: (sessionId: string | null, backendNodeId: number) => string;
+  // Applied to every name/value BEFORE whitespace folding and truncation, so a
+  // secret longer than maxTextLength (or containing whitespace) is replaced
+  // whole instead of leaking its prefix past a later redaction pass.
+  redact?: (text: string) => string;
 };
 
 export type SnapshotResult = {
@@ -109,7 +113,7 @@ export function renderSnapshot(frames: AXFrame[], options: SnapshotOptions = {})
   const rendered_frames = new Set<AXFrame>();
 
   const clip = (text: string): string => {
-    const clean = text.replace(/\s+/g, " ").trim();
+    const clean = (options.redact ? options.redact(text) : text).replace(/\s+/g, " ").trim();
     return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
   };
 
