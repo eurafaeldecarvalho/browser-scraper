@@ -456,11 +456,39 @@ export class McpServer {
     return this._browser;
   }
 
+  private _launching: Promise<Browser> | null = null;
+
+  // Single-flight: an abandoned (timed-out) call still launching must not race
+  // the next call into a second launch on the same Browser/profile.
   private async _launched_browser(): Promise<Browser> {
+    this._assert_current();
+    while (this._launching) {
+      await this._launching.catch(() => undefined);
+    }
     const browser = this._ensure_browser();
-    if (!browser.launched || !this._browser_setup) {
+    if (browser.launched && this._browser_setup) {
+      return browser;
+    }
+    const launching = this._launch(browser);
+    this._launching = launching;
+    try {
+      return await launching;
+    } finally {
+      if (this._launching === launching) {
+        this._launching = null;
+      }
+    }
+  }
+
+  private async _launch(browser: Browser): Promise<Browser> {
+    {
       this._browser_setup = true;
-      await browser.launch();
+      try {
+        await browser.launch();
+      } catch (error) {
+        this._browser_setup = false;
+        throw error;
+      }
       for (const target of await browser.getTabs()) {
         if (target.type === "page") {
           this._startup_targets.add(String(target.id));
@@ -585,7 +613,7 @@ export class McpServer {
     const tab = await this._require_tab();
     const pending = this._pending_dialogs.get(tab.target_id);
     if (pending) {
-      throw new Error(`A ${pending.type} dialog is open on this tab: "${pending.message}". Answer it with handle_dialog first.`);
+      throw new Error(`A ${pending.type} dialog is open on this tab: ${this._untrusted(pending.message.slice(0, 300))}\nAnswer it with handle_dialog first.`);
     }
     return tab;
   }
@@ -658,10 +686,13 @@ export class McpServer {
   // Every page in the browser — the ones opened through tools and the ones the
   // site opened (popups, target=_blank) — in Chrome's order.
   private async _list_pages(): Promise<Array<{ id: string; targetId: string; url: string; title: string }>> {
+    this._assert_current();
     if (!this._browser) {
       return [];
     }
     const targets = await this._browser.getTabs();
+    // It prunes tab ids and may clear the current tab: not from a stale call.
+    this._assert_current();
     const pages = targets.filter(
       (target) =>
         target.type === "page" &&
@@ -721,6 +752,9 @@ export class McpServer {
   }
 
   private async _require_tab(): Promise<Tab> {
+    // An abandoned call must not pick up the tab re-attached for the calls
+    // that came after it and keep acting on it.
+    this._assert_current();
     if (!this._tab) {
       throw new Error("No page is open yet — call navigate first.");
     }
@@ -1911,6 +1945,10 @@ export class McpServer {
           } catch (error) {
             // The page already closed it (navigation, timeout): nothing to answer.
             if (!/no dialog/i.test(String((error as Error)?.message ?? error))) {
+              // Still showing: keep it answerable instead of losing it.
+              if (!this._pending_dialogs.has(tab.target_id)) {
+                this._pending_dialogs.set(tab.target_id, pending);
+              }
               throw error;
             }
             gone = true;
