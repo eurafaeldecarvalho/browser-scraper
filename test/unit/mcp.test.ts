@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { McpServer, parseEnvFile, profileInUse } from "../../src/index";
 import { parseKeyCombo } from "../../src/behavior/keyboard";
 import { find_option, read_session_file, safe_filename, wait_timeout_ms } from "../../src/mcp/server";
+import { CDPClient, runUnguarded } from "../../src/core/cdp-client";
 
 test("initialize negotiates the protocol and advertises tools", async () => {
   const server = new McpServer({ version: "9.9.9" });
@@ -453,4 +454,93 @@ test("type returns at once when a keystroke opens a dialog in manual mode", asyn
   server._pending_dialogs.set("T1", { type: "alert", message: "hi", defaultPrompt: "", dialog: {} });
   for (const waiter of server._dialog_waiters) waiter("T1");
   assert.match((await run).content[0].text, /alert dialog is open/);
+});
+
+test("any CDP command from an abandoned call is refused, on any connection", async () => {
+  const server = new McpServer({ toolTimeoutMs: 50 }) as any;
+  const other_tab_cdp = new CDPClient("ws://127.0.0.1:1/devtools/page/X");
+  const outcome = await in_abandoned_call(server, () => other_tab_cdp.send("Runtime.evaluate", { expression: "1" }));
+  assert.match(String((outcome as Error)?.message), /timed out and was abandoned/);
+  // Cleanup/launch work wrapped in runUnguarded is not refused by the guard.
+  const unguarded = await in_abandoned_call(server, () => runUnguarded(() => other_tab_cdp.send("Runtime.evaluate", { expression: "1" })));
+  assert.doesNotMatch(String((unguarded as Error)?.message), /abandoned/);
+});
+
+test("a launch started by a call that is then abandoned still completes for the next call", async () => {
+  const server = new McpServer({ toolTimeoutMs: 50 }) as any;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let launch_error: unknown = null;
+  const browser = {
+    launched: false,
+    alive: true,
+    launch: async () => {
+      await gate;
+      // A CDP command inside the launch (stealth setup, downloads…).
+      await new CDPClient("ws://127.0.0.1:1/x").send("Browser.getVersion").catch((error: Error) => { launch_error = error; });
+      browser.launched = true;
+    },
+    getTabs: async () => [],
+    wsEndpoint: null,
+    forgetTab: async () => undefined,
+  };
+  server._browser = browser;
+  const tool = { name: "check_egress", run: async () => { await server._launched_browser(); return { content: [] }; } };
+  await assert.rejects(server._run_tool(tool, {}), /did not finish within/);
+  release();
+  await server._launched_browser();
+  assert.doesNotMatch(String((launch_error as Error)?.message), /abandoned/);
+  assert.equal(browser.launched, true);
+});
+
+test("an action cut short by a manual dialog cannot keep acting after the dialog is answered", async () => {
+  const server = new McpServer({ dialogPolicy: "manual" }) as any;
+  let resume!: () => void;
+  const blocked = new Promise<void>((resolve) => (resume = resolve));
+  let later: unknown = null;
+  const tab: any = { target_id: "T1" };
+  const action = async () => { await blocked; try { server._assert_current(); later = "typed the rest"; } catch (error) { later = error; } };
+  const acting = server._act(tab, action);
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  for (const waiter of server._dialog_waiters) waiter("T1");
+  assert.equal(await acting, true);
+  resume();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.match(String((later as Error)?.message), /abandoned/);
+  // The call itself is still current.
+  server._assert_current();
+});
+
+test("every tool returns the dialog state when a manual dialog opens mid-call (central race)", async () => {
+  const server = new McpServer({ dialogPolicy: "manual" }) as any;
+  const tab: any = { target_id: "T1", snapshot: () => new Promise(() => undefined), url: async () => "https://x.test/", title: async () => "x" };
+  server._tab = tab;
+  server._browser = { launched: true, alive: true, getTabs: async () => [{ type: "page", id: "T1", url: "https://x.test/", title: "x" }] };
+  for (const name of ["snapshot", "markdown", "metadata", "screenshot", "wait", "tab_info"]) {
+    tab.markdown = tab.metadata = tab.screenshot = () => new Promise(() => undefined);
+    tab.sleep = () => new Promise(() => undefined);
+    tab.url = name === "tab_info" ? () => new Promise(() => undefined) : async () => "https://x.test/";
+    server._pending_dialogs.clear();
+    const tool = server._tools.find((entry: any) => entry.name === name);
+    const run = server._run_tool(tool, { seconds: 5 });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    server._pending_dialogs.set("T1", { type: "alert", message: "hi", defaultPrompt: "", dialog: {} });
+    for (const waiter of server._dialog_waiters) waiter("T1");
+    const result = await run;
+    assert.match(result.content[0].text, /stopped: a dialog opened[\s\S]*alert dialog is open/, name);
+  }
+});
+
+test("a dialog on a page attached for export_session is handled by the dialog policy", async () => {
+  const server = new McpServer() as any;
+  const dir = mkdtempSync(join(tmpdir(), "bs-export-"));
+  let wired = 0;
+  const page: any = { target_id: "P2", cdp: { on: () => undefined, send: async (method: string) => (method === "DOMStorage.getDOMStorageItems" ? { entries: [] } : {}) }, onDialog: () => { wired++; } };
+  const current: any = { target_id: "P1", cdp: { on: () => undefined, send: async () => ({ cookies: [] }) }, onDialog: () => undefined };
+  server._browser = { launched: true, alive: true, getTabs: async () => [{ type: "page", id: "P2", url: "https://a.test/", title: "" }, { type: "page", id: "P1", url: "about:blank", title: "" }], attachTab: async () => page };
+  server._browser_setup = true;
+  server._tab = current;
+  const tool = server._tools.find((entry: any) => entry.name === "export_session");
+  await tool.run({ path: join(dir, "s.json") });
+  assert.equal(wired, 1);
 });

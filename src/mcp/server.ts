@@ -6,7 +6,7 @@ import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { Browser, type BrowserOptions } from "../core/browser";
-import { CDPClient } from "../core/cdp-client";
+import { addSendGuard, CDPClient, runUnguarded } from "../core/cdp-client";
 import type { Element } from "../core/element";
 import { Dialog, type Tab } from "../core/tab";
 import { scrape, type ScrapeFormat } from "../scrape";
@@ -50,6 +50,16 @@ export type McpServerOptions = {
 type JsonRpcMessage = { jsonrpc: "2.0"; id?: string | number | null; method?: string; params?: any };
 type ToolContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 type ToolResult = { content: ToolContent[]; isError?: boolean };
+
+// One per tool call (and per piece of work a call detaches, see _detached).
+// A context is stale once its call timed out (generation moved on) or the work
+// was abandoned (a manual dialog returned control first); every CDP command
+// and every state change from a stale context is refused.
+type CallContext = { generation: number; abandoned: boolean; parent: CallContext | null };
+
+// Tools raced against a manual dialog opening on the current tab: none of these
+// touch the current page's renderer, so a dialog cannot freeze them.
+const NO_DIALOG_RACE = new Set(["close_browser", "wait_for_download", "check_egress", "scrape"]);
 
 type PendingDialog = { dialog: Dialog; type: string; message: string; defaultPrompt: string };
 type DownloadEntry = { guid: string; url: string; suggestedFilename: string; state: "inProgress" | "completed" | "canceled"; path: string | null; reported: boolean; noted: boolean };
@@ -132,7 +142,7 @@ export class McpServer {
   // background and must not change the current tab or relaunch the browser
   // under the calls that come after it.
   private _generation = 0;
-  private _call_generation = new AsyncLocalStorage<number>();
+  private _call_context = new AsyncLocalStorage<CallContext>();
   private _out: NodeJS.WritableStream;
 
   constructor(options: McpServerOptions = {}) {
@@ -140,6 +150,9 @@ export class McpServer {
     this._out = options.output ?? process.stdout;
     this._downloads_dir = resolve_path(options.downloadsDir ?? join(tmpdir(), "browser-scraper-downloads"));
     this._tools = this._define_tools();
+    // Structural guard: a CDP command issued from an abandoned call (or its
+    // detached work) fails, on whatever tab or connection it targets.
+    addSendGuard(() => this._assert_current());
   }
 
   get tools(): Array<Omit<ToolDef, "run">> {
@@ -220,7 +233,7 @@ export class McpServer {
       timer.unref?.();
     });
     const generation = this._generation;
-    const call = this._call_generation.run(generation, () => this._run_tool_inner(tool, args));
+    const call = this._call_context.run({ generation, abandoned: false, parent: null }, () => this._run_tool_inner(tool, args));
     void call.catch(() => undefined);
     try {
       return await Promise.race([call, timeout]);
@@ -269,8 +282,62 @@ export class McpServer {
 
   // True inside a call that timed out and was abandoned.
   private _stale(): boolean {
-    const generation = this._call_generation.getStore();
-    return generation !== undefined && generation !== this._generation;
+    for (let context = this._call_context.getStore() ?? null; context; context = context.parent) {
+      if (context.abandoned || context.generation !== this._generation) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Runs `fn` as separately abandonable work of the current call.
+  private _detached<T>(fn: () => Promise<T>): { context: CallContext; promise: Promise<T> } {
+    const parent = this._call_context.getStore() ?? null;
+    const context: CallContext = { generation: parent?.generation ?? this._generation, abandoned: false, parent };
+    const promise = this._call_context.run(context, fn);
+    void promise.catch(() => undefined);
+    return { context, promise };
+  }
+
+  // Resolves with the target id when a manual dialog opens on the tab that is
+  // current at that moment. Call cancel() when done.
+  private _dialog_on_current(): { opened: Promise<void>; cancel: () => void } {
+    let waiter: (target_id: string) => void = () => undefined;
+    const opened = new Promise<void>((resolve) => {
+      waiter = (target_id) => {
+        if (target_id === this._tab?.target_id) {
+          resolve();
+        }
+      };
+    });
+    this._dialog_waiters.add(waiter);
+    return { opened, cancel: () => this._dialog_waiters.delete(waiter) };
+  }
+
+  // Every tool, centrally: in manual dialog mode a dialog that opens on the
+  // current tab while the tool runs returns the dialog state at once (the page
+  // is frozen behind it), and the rest of the tool is abandoned so it cannot
+  // act after the agent answers the dialog.
+  private async _run_raced(tool: ToolDef, args: Record<string, any>): Promise<ToolResult> {
+    if ((this._options.dialogPolicy ?? "accept") !== "manual" || NO_DIALOG_RACE.has(tool.name)) {
+      return tool.run(args);
+    }
+    const dialog = this._dialog_on_current();
+    const work = this._detached(() => tool.run(args));
+    try {
+      const winner = await Promise.race([work.promise, dialog.opened.then(() => null)]);
+      if (winner !== null) {
+        return winner;
+      }
+    } finally {
+      dialog.cancel();
+    }
+    work.context.abandoned = true;
+    const tab = this._tab;
+    if (!tab) {
+      throw new Error(`A dialog opened during ${tool.name}; call handle_dialog.`);
+    }
+    return { content: [{ type: "text", text: `${tool.name} stopped: a dialog opened.\n${await this._page_state(tab)}` }] };
   }
 
   private _assert_current(): void {
@@ -284,7 +351,7 @@ export class McpServer {
       await this._relaunch_notice();
     }
     try {
-      return await tool.run(args);
+      return await this._run_raced(tool, args);
     } catch (error) {
       if (tool.name === "close_browser" || !this._browser?.launched || this._stale()) {
         throw error;
@@ -305,7 +372,7 @@ export class McpServer {
       if (!RETRY_AFTER_RELAUNCH.has(tool.name)) {
         throw new Error(`The browser had closed or crashed during ${tool.name}; it was relaunched on the same profile (cookies kept) but the page is gone and the action was NOT repeated. Navigate again, then retry.`);
       }
-      return tool.run(args);
+      return this._run_raced(tool, args);
     }
   }
 
@@ -471,7 +538,10 @@ export class McpServer {
     if (browser.launched && this._browser_setup) {
       return browser;
     }
-    const launching = this._launch(browser);
+    // Shared with later calls (single-flight) and must finish as a whole even
+    // if this call is abandoned meanwhile: a half-done launch leaves a Chrome
+    // holding the profile that the next launch then trips over.
+    const launching = runUnguarded(() => this._launch(browser));
     this._launching = launching;
     try {
       return await launching;
@@ -632,10 +702,15 @@ export class McpServer {
       waiter = (target_id) => target_id === tab.target_id && resolve(true);
       this._dialog_waiters.add(waiter);
     });
-    const done = action().then((): boolean => false);
-    void done.catch(() => undefined);
+    const work = this._detached(action);
     try {
-      return await Promise.race([done, opened]);
+      const dialog = await Promise.race([work.promise.then((): boolean => false), opened]);
+      if (dialog) {
+        // The action resumes once the agent answers: it must not keep
+        // typing/clicking behind the next call's back.
+        work.context.abandoned = true;
+      }
+      return dialog;
     } finally {
       this._dialog_waiters.delete(waiter!);
     }
@@ -665,7 +740,7 @@ export class McpServer {
     if (!this._tab) {
       this._assert_current();
       const browser = await this._launched_browser();
-      const tab = await browser.newTab();
+      const tab = await runUnguarded(() => browser.newTab());
       await this._discard_if_stale(browser, tab);
       this._tab = tab;
       this._tab_id_for(this._tab.target_id);
@@ -1173,10 +1248,14 @@ export class McpServer {
         continue;
       }
       if (page_origin === origin && !this._pending_dialogs.has(page.targetId)) {
-        return fn(await browser.attachTab(page.targetId));
+        const tab = await browser.attachTab(page.targetId);
+        this._assert_current();
+        // Attached pages get the dialog policy like any other tab.
+        this._wire(tab);
+        return fn(tab);
       }
     }
-    const temp = await browser.newTab();
+    const temp = await runUnguarded(() => browser.newTab());
     await this._discard_if_stale(browser, temp);
     this._seen_targets.add(temp.target_id);
     this._startup_targets.add(temp.target_id);
@@ -1321,7 +1400,9 @@ export class McpServer {
             this._check_url(String(args.url));
           }
           const browser = await this._launched_browser();
-          const tab = await browser.newTab();
+          // Unguarded: a page created by /json/new must be fully attached to
+          // be closed again when the call turns out to be stale.
+          const tab = await runUnguarded(() => browser.newTab());
           await this._discard_if_stale(browser, tab);
           this._tab_id_for(tab.target_id);
           this._wire(tab);
@@ -2081,7 +2162,14 @@ export class McpServer {
             }
             // Read through that page's own connection (see _with_origin_tab).
             this._assert_current();
-            const items = this._pending_dialogs.has(page.targetId) ? null : await this._read_local_storage(await this._ensure_browser().attachTab(page.targetId), origin);
+            let items: Record<string, string> | null = null;
+            if (!this._pending_dialogs.has(page.targetId)) {
+              const attached = await this._ensure_browser().attachTab(page.targetId);
+              this._assert_current();
+              // Attached pages get the dialog policy like any other tab.
+              this._wire(attached);
+              items = await this._read_local_storage(attached, origin);
+            }
             if (items && Object.keys(items).length > 0) {
               origins[origin] = { localStorage: items };
             }

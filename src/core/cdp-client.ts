@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { setTimeout as delay } from "node:timers/promises";
 
 import WebSocket, { type RawData } from "ws";
@@ -12,6 +13,24 @@ export class CDPError extends Error {
     this.code = code;
     this.data = data;
   }
+}
+
+// Send guards: process-wide checks run before every CDP command. A caller (the
+// MCP server) uses them to refuse commands issued by work it has abandoned —
+// enforced here, once, instead of at every call site. Event handlers and code
+// wrapped in runUnguarded() (cleanup, launch, answering dialogs) are exempt.
+const unguarded = new AsyncLocalStorage<boolean>();
+const send_guards = new Set<() => void>();
+
+export function addSendGuard(guard: () => void): () => void {
+  send_guards.add(guard);
+  return () => {
+    send_guards.delete(guard);
+  };
+}
+
+export function runUnguarded<T>(fn: () => T): T {
+  return unguarded.run(true, fn);
 }
 
 type CDPEventHandler = (params: Record<string, unknown>) => void | Promise<void>;
@@ -74,7 +93,9 @@ export class CDPClient {
       // handler that throws while Chrome is dying) must never escape as a fatal
       // unhandledRejection — which the AWS Lambda runtime turns into a failed
       // invocation. _dispatch_event also guards each handler individually.
-      void this._handle_message(message.toString()).catch(() => {});
+      // Events are not part of any caller's work: run them unguarded (the
+      // socket would otherwise inherit the context of the call that opened it).
+      void runUnguarded(() => this._handle_message(message.toString())).catch(() => {});
     });
 
     this._ws.on("close", () => {
@@ -153,6 +174,11 @@ export class CDPClient {
     params: Record<string, unknown> = {},
     session_id: string | null = null,
   ): Promise<any> {
+    if (!unguarded.getStore()) {
+      for (const guard of send_guards) {
+        guard();
+      }
+    }
     if (!this._connected) {
       await this.connect();
     }
