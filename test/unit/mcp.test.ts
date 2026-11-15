@@ -233,3 +233,37 @@ test("a window.open storm is summarized in the notes", async () => {
   assert.match(notes, /opened 35 more tab\(s\) — call list_tabs/);
   assert.equal(await server._collect_notes(), "");
 });
+
+test("a timed-out call loses its tab connection and the tab is re-attached fresh", async () => {
+  const server = new McpServer({ toolTimeoutMs: 200 }) as any;
+  const old_tab = { target_id: "T1" };
+  const fresh_tab = { target_id: "T1", cdp: { on: () => undefined }, onDialog: () => undefined };
+  const forgotten: string[] = [];
+  server._browser = { launched: true, alive: true, forgetTab: async (id: string) => { forgotten.push(id); }, attachTab: async () => fresh_tab };
+  server._tab = old_tab;
+  server._pending_dialogs.set("T1", {});
+  const stuck = { name: "evaluate", run: () => new Promise(() => undefined) };
+  await assert.rejects(server._run_tool(stuck, {}), /did not finish within/);
+  assert.deepEqual(forgotten, ["T1"]);
+  assert.equal(server._tab, fresh_tab);
+  assert.equal(server._pending_dialogs.size, 0);
+});
+
+test("download records are bounded; unreported ones are kept", () => {
+  const server = new McpServer() as any;
+  for (let i = 0; i < 500; i++) {
+    server._record_download({ guid: `g${i}`, url: "u", suggestedFilename: "f" });
+    server._downloads[server._downloads.length - 1].reported = i !== 3;
+  }
+  assert.ok(server._downloads.length <= 200, String(server._downloads.length));
+  assert.ok(server._downloads.some((d: any) => d.guid === "g3"));
+  assert.equal(server._downloads[server._downloads.length - 1].guid, "g499");
+});
+
+test("an off-domain landing with no history to go back to leaves the page", async () => {
+  const server = new McpServer({ allowedDomains: ["example.com"] }) as any;
+  const visited: string[] = [];
+  const tab = { url: async () => "https://evil.test/", back: async () => undefined, goto: async ({ url }: { url: string }) => { visited.push(url); } };
+  await assert.rejects(server._enforce_location(tab), /rolled back/);
+  assert.deepEqual(visited, ["about:blank"]);
+});

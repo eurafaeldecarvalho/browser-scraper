@@ -71,6 +71,9 @@ const LONG_TOOL_TIMEOUT_MS: Record<string, number> = { wait_for_download: 630_00
 // must not grow memory or flood the agent's context.
 const MAX_NOTES = 20;
 
+// Download records kept for wait_for_download; reported ones are pruned first.
+const MAX_DOWNLOAD_ENTRIES = 200;
+
 // import_session refuses bigger files (a real session export is a few hundred KB).
 const MAX_SESSION_FILE_BYTES = 20 * 1024 * 1024;
 
@@ -211,8 +214,37 @@ export class McpServer {
     });
     try {
       return await Promise.race([this._run_tool_inner(tool, args), timeout]);
+    } catch (error) {
+      if (/did not finish within/.test(String((error as Error)?.message ?? error))) {
+        await this._abandon_current_tab();
+      }
+      throw error;
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  // After a timeout the abandoned call is still running and would keep acting
+  // on the page (a late click, a late type) while the next call runs. Dropping
+  // the tab's CDP connection makes every pending/future command of that call
+  // fail; the page itself stays open and is re-attached on a fresh connection.
+  private async _abandon_current_tab(): Promise<void> {
+    const tab = this._tab;
+    const browser = this._browser;
+    if (!tab || !browser) {
+      return;
+    }
+    const target_id = tab.target_id;
+    this._pending_dialogs.delete(target_id);
+    this._wired.delete(target_id);
+    this._tab = null;
+    await browser.forgetTab(target_id).catch(() => undefined);
+    try {
+      const fresh = await browser.attachTab(target_id);
+      this._wire(fresh);
+      this._tab = fresh;
+    } catch {
+      // The page is gone or unreachable: the next call says so.
     }
   }
 
@@ -418,7 +450,7 @@ export class McpServer {
     this._browser_cdp = cdp;
     cdp.on("Browser.downloadWillBegin", (params) => {
       const p = params as Record<string, any>;
-      this._downloads.push({ guid: String(p.guid), url: String(p.url ?? ""), suggestedFilename: String(p.suggestedFilename ?? "download"), state: "inProgress", path: null, reported: false, noted: false });
+      this._record_download(p);
     });
     cdp.on("Browser.downloadProgress", (params) => {
       const p = params as Record<string, any>;
@@ -432,6 +464,17 @@ export class McpServer {
       entry.state = p.state;
     });
     await cdp.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: this._downloads_dir, eventsEnabled: true });
+  }
+
+  private _record_download(p: Record<string, any>): void {
+    // Hours of downloads: keep the unreported ones and the latest reported.
+    if (this._downloads.length >= MAX_DOWNLOAD_ENTRIES) {
+      const index = this._downloads.findIndex((download) => download.reported);
+      if (index >= 0) {
+        this._downloads.splice(index, 1);
+      }
+    }
+    this._downloads.push({ guid: String(p.guid), url: String(p.url ?? ""), suggestedFilename: String(p.suggestedFilename ?? "download"), state: "inProgress", path: null, reported: false, noted: false });
   }
 
   private _finalize_download(entry: DownloadEntry): string {
@@ -706,6 +749,22 @@ export class McpServer {
       this._check_url(url);
     } catch (error) {
       await tab.back({ timeout: 10_000 }).catch(() => undefined);
+      // No history to go back to (a fresh tab, a redirect on the first load):
+      // leave the disallowed page anyway.
+      const still_outside = await tab.url().then(
+        (now) => {
+          try {
+            this._check_url(now);
+            return false;
+          } catch {
+            return /^https?:/i.test(now);
+          }
+        },
+        () => true,
+      );
+      if (still_outside) {
+        await tab.goto({ url: "about:blank", timeout: 10_000 }).catch(() => undefined);
+      }
       throw new Error(`${String((error as Error).message)} The action navigated there and was rolled back.`);
     }
   }
@@ -1127,7 +1186,11 @@ export class McpServer {
             await tab.bringToFront().catch(() => undefined);
           }
           if (args.url) {
-            await tab.goto({ url: String(args.url), waitUntil: args.waitUntil ?? "load", timeout: 45_000 });
+            // A dialog on load (manual mode) returns control instead of
+            // stalling the load until its timeout.
+            if (await this._act(tab, () => tab.goto({ url: String(args.url), waitUntil: args.waitUntil ?? "load", timeout: 45_000 }))) {
+              return text(await this._page_state(tab));
+            }
             await this._enforce_location(tab);
           }
           return text(await this._page_state(tab));
@@ -1214,7 +1277,8 @@ export class McpServer {
         run: async (args) => {
           const tab = await this._ready_tab();
           const snap = await tab.snapshot({ interactive: Boolean(args.interactiveOnly) });
-          return text(`${await this._tab_header(tab)}\nPage: ${await tab.title().catch(() => "")}\nURL: ${await tab.url()}\n\n${this._untrusted(snap)}`);
+          const notes = await this._collect_notes();
+          return text(`${await this._tab_header(tab)}\nPage: ${await tab.title().catch(() => "")}\nURL: ${await tab.url()}${notes ? `\n${notes}` : ""}\n\n${this._untrusted(snap)}`);
         },
       },
       {
@@ -1307,6 +1371,8 @@ export class McpServer {
           const tab = await this._ready_tab();
           if (!(await this._act(tab, () => tab.reload({ timeout: 45_000 })))) {
             await tab.sleep({ milliseconds: 500 });
+            // The reload may redirect (expired session → SSO on another domain).
+            await this._enforce_location(tab);
           }
           return text(await this._page_state(tab));
         },
