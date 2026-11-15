@@ -258,6 +258,10 @@ describe("mcp bot tools over stdio (e2e)", { skip: chrome ? false : "Chrome not 
     assert.ok(browser_pid, "chrome pid for profile");
     process.kill(browser_pid);
     await new Promise((resolve) => setTimeout(resolve, 1_500));
+    // A read-only call that cannot be served (the pages are gone) says why.
+    const snap = await tool("snapshot");
+    assert.equal(snap.isError, true);
+    assert.match(snap.text, /relaunched on the same profile/);
     const out = await tool("navigate", { url: `${server.origin}/products` });
     assert.equal(out.isError, false, out.text);
     assert.match(out.text, /relaunched on the same profile/);

@@ -178,6 +178,10 @@ export class HumanMouse {
       type: "mouseMoved",
       x,
       y,
+      // Chrome only treats a move as a drag when `button` names the held
+      // button; `buttons` alone leaves it a hover (a native range thumb or a
+      // pointer-capture slider would stop following the cursor).
+      ...(buttons ? { button: held_button(buttons) } : {}),
       buttons,
     });
   }
@@ -325,6 +329,10 @@ function random_int(min: number, max: number): number {
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function held_button(buttons: number): "left" | "right" | "middle" {
+  return buttons & 1 ? "left" : buttons & 2 ? "right" : "middle";
 }
 
 // MouseEvent.buttons bitmask (left=1, right=2, middle=4) so a held-button drag

@@ -122,6 +122,10 @@ const MAX_STORED_URL = 2_048;
 // response_body refuses bodies larger than this (the whole body crosses CDP
 // and is held in memory before truncation).
 const MAX_BODY_BYTES = 10 * 1024 * 1024;
+const BODY_SETTLE_MS = 5_000;
+const NAV_TIMEOUT_MS = 45_000;
+const NAV_SETTLE_MS = 15_000;
+const TURNSTILE_APPEAR_MS = 5_000;
 
 export function clip_url(url: string): string {
   return url.length > MAX_STORED_URL ? `${url.slice(0, MAX_STORED_URL)}…` : url;
@@ -180,6 +184,9 @@ export class McpServer {
   private _pending_dialogs = new Map<string, PendingDialog>();
   private _dialog_waiters = new Set<(target_id: string) => void>();
   private _notes: string[] = [];
+  // Set when Chrome died and was relaunched: until a page is opened again,
+  // "no page" errors say why the page the agent was on is gone.
+  private _pages_lost = false;
   private _downloads: DownloadEntry[] = [];
   private _downloads_dir: string;
   private _browser_cdp: CDPClient | null = null;
@@ -457,11 +464,19 @@ export class McpServer {
     if (tool.name !== "close_browser" && tool.name !== "browser_status" && this._browser?.launched && !this._browser.alive) {
       await this._relaunch_notice();
     }
+    const acting_on = this._tab?.target_id ?? null;
     try {
       return await this._run_raced(tool, args);
     } catch (error) {
       if (tool.name === "close_browser" || !this._browser?.launched || this._stale()) {
         throw error;
+      }
+      // The page closed itself during the action (an OAuth/"Continue with
+      // Google" popup posting its result and calling window.close()): that is
+      // the action succeeding, not a failure. Fall back to another tab.
+      const closed = acting_on && this._browser.alive ? await this._closed_itself(acting_on) : null;
+      if (closed) {
+        return closed;
       }
       const message = String((error as Error)?.message ?? error);
       await delay(300);
@@ -483,9 +498,70 @@ export class McpServer {
     }
   }
 
+  // When `target_id` (the tab the failed call acted on) no longer exists but
+  // Chrome does, makes another open tab current and reports it; null when the
+  // tab is still there (the error was a real one).
+  private async _closed_itself(target_id: string): Promise<ToolResult | null> {
+    let pages: Array<{ id: string; targetId: string }>;
+    const id = this._tab_id_for(target_id);
+    try {
+      pages = await this._list_pages();
+    } catch {
+      return null;
+    }
+    if (pages.some((entry) => entry.targetId === target_id)) {
+      return null;
+    }
+    if (this._tab?.target_id === target_id) {
+      this._tab = null;
+    }
+    if (pages.length === 0) {
+      return { content: [{ type: "text", text: `Tab ${id} closed itself during the action (no tabs left) — call navigate or new_tab.` }] };
+    }
+    const next = await this._activate(pages[pages.length - 1].targetId);
+    return { content: [{ type: "text", text: `Tab ${id} closed itself during the action (e.g. a sign-in popup that finished). Current tab is now ${this._tab_id_for(next.target_id)}.\n\n${await this._page_state(next)}` }] };
+  }
+
+  // Navigates and waits for `wait_until`. The document itself must arrive
+  // within NAV_TIMEOUT_MS; after that, a page whose load / network-idle never
+  // comes (a hanging tracker pixel, a long-poll) is returned as it is after
+  // NAV_SETTLE_MS with a note, instead of failing the call after 45 s.
+  private async _goto(tab: Tab, url: string, wait_until: unknown): Promise<string> {
+    const mode = String(wait_until ?? "load");
+    if (!["load", "domcontentloaded", "networkidle0", "networkidle2"].includes(mode)) {
+      throw new Error(`waitUntil must be load, domcontentloaded, networkidle0 or networkidle2 (got ${mode}).`);
+    }
+    await tab.goto({ url, waitUntil: "domcontentloaded", timeout: NAV_TIMEOUT_MS });
+    if (mode === "domcontentloaded") {
+      return "";
+    }
+    const settled = mode === "load"
+      ? this._until(async () => (await tab.evaluate({ expression: "document.readyState" }).catch(() => "")) === "complete", NAV_SETTLE_MS)
+      : tab.waitForNetworkIdle({ maxInflight: mode === "networkidle2" ? 2 : 0, timeout: NAV_SETTLE_MS }).then(() => true, () => false);
+    if (await settled) {
+      return "";
+    }
+    return `Note: the page did not reach "${mode}" within ${NAV_SETTLE_MS / 1_000}s after its HTML loaded (some request is still hanging); showing it as it is.
+`;
+  }
+
+  private async _until(probe: () => Promise<boolean>, timeout_ms: number): Promise<boolean> {
+    for (const deadline = Date.now() + timeout_ms; ; ) {
+      this._assert_current();
+      if (await probe()) {
+        return true;
+      }
+      if (Date.now() >= deadline) {
+        return false;
+      }
+      await delay(150);
+    }
+  }
+
   private async _relaunch_notice(): Promise<void> {
     this._assert_current();
     await this.close();
+    this._pages_lost = true;
     this._note("The browser had been closed or crashed; it was relaunched on the same profile (cookies kept). Pages that were open are gone — navigate again if needed.");
   }
 
@@ -859,6 +935,7 @@ export class McpServer {
       const tab = await runUnguarded(() => browser.newTab());
       await this._discard_if_stale(browser, tab);
       this._tab = tab;
+      this._pages_lost = false;
       this._tab_id_for(this._tab.target_id);
       this._wire(this._tab);
     }
@@ -944,6 +1021,7 @@ export class McpServer {
     this._assert_current();
     this._wire(tab);
     this._tab = tab;
+    this._pages_lost = false;
     if (this._options.browserOptions?.headless === false) {
       await tab.bringToFront().catch(() => undefined);
     }
@@ -964,6 +1042,13 @@ export class McpServer {
     // that came after it and keep acting on it.
     this._assert_current();
     if (!this._tab) {
+      const open = [...this._tab_ids.keys()];
+      if (open.length && this._browser?.alive) {
+        throw new Error(`The current tab was closed. Open tabs: ${open.join(", ")} — call switch_tab, or navigate to open a page here.`);
+      }
+      if (this._pages_lost) {
+        throw new Error("The browser had closed or crashed and was relaunched on the same profile (cookies kept); the pages that were open are gone — navigate again.");
+      }
       throw new Error("No page is open yet — call navigate first.");
     }
     return this._tab;
@@ -1122,6 +1207,14 @@ export class McpServer {
   }
 
   private async _response_body(entry: NetEntry, max_chars: number): Promise<string> {
+    // Headers in, body still streaming (or not yet flagged finished: Chrome
+    // reports loadingFinished a little after responseReceived, later still for
+    // a fetch whose body the page has not read yet): give it a few seconds
+    // instead of failing a call made right after the page loaded.
+    for (const started = Date.now(); entry.state === "pending" && entry.status > 0 && Date.now() - started < BODY_SETTLE_MS; ) {
+      this._assert_current();
+      await delay(100);
+    }
     if (entry.state !== "finished") {
       throw new Error(`${entry.id} has no body (${entry.state === "failed" ? `failed: ${entry.error}` : "still loading"}).`);
     }
@@ -1832,11 +1925,12 @@ export class McpServer {
           }
           // A beforeunload dialog (manual mode) returns control instead of
           // stalling the navigation until its timeout.
-          if (await this._act(tab, () => tab.goto({ url: String(args.url), waitUntil: args.waitUntil ?? "load", timeout: 45_000 }))) {
+          let note = "";
+          if (await this._act(tab, async () => { note = await this._goto(tab, String(args.url), args.waitUntil); })) {
             return text(await this._page_state(tab));
           }
           await this._enforce_location(tab);
-          return text(await this._page_state(tab));
+          return text(`${note}${await this._page_state(tab)}`);
         },
       },
       {
@@ -1863,13 +1957,14 @@ export class McpServer {
           this._tab_id_for(tab.target_id);
           this._wire(tab);
           this._tab = tab;
+          this._pages_lost = false;
           if (this._options.browserOptions?.headless === false) {
             await tab.bringToFront().catch(() => undefined);
           }
           if (args.url) {
             // A dialog on load (manual mode) returns control instead of
             // stalling the load until its timeout.
-            if (await this._act(tab, () => tab.goto({ url: String(args.url), waitUntil: args.waitUntil ?? "load", timeout: 45_000 }))) {
+            if (await this._act(tab, async () => { const note = await this._goto(tab, String(args.url), args.waitUntil); if (note) { this._note(note.trim()); } })) {
               return text(await this._page_state(tab));
             }
             await this._enforce_location(tab);
@@ -2100,8 +2195,14 @@ export class McpServer {
         annotations: { readOnlyHint: true },
         run: async (args) => {
           const tab = await this._ready_tab();
-          await tab.sleep({ milliseconds: Math.min(30, Math.max(0, Number(args.seconds) || 0)) * 1_000 });
-          return text(await this._page_state(tab));
+          const asked = Math.max(0, Number(args.seconds) || 0);
+          const seconds = Math.min(30, asked);
+          // Exactly what was asked: tab.sleep() jitters ±50%, which turned "wait 30" into 45 s.
+          await delay(seconds * 1_000);
+          const capped = asked > seconds ? `Waited ${seconds} s (the maximum; ${asked} s was asked — call wait_for for longer conditions).
+
+` : "";
+          return text(`${capped}${await this._page_state(tab)}`);
         },
       },
       {
@@ -2170,6 +2271,14 @@ export class McpServer {
         run: async () => {
           const tab = await this._ready_tab();
           let solved: unknown = false;
+          // No widget at all (wrong page, already passed): say so in seconds
+          // instead of letting the solver wait its full 30 s for one to render.
+          const present = async (): Promise<boolean> => Boolean(await tab.turnstileToken().catch(() => null)) || (await tab.turnstilePresent().catch(() => false));
+          if (!(await this._until(present, TURNSTILE_APPEAR_MS))) {
+            return text(`solved: false — no Cloudflare Turnstile widget on this page (waited ${TURNSTILE_APPEAR_MS / 1_000}s).
+
+${await this._page_state(tab)}`);
+          }
           if (await this._act(tab, async () => { solved = (await tab.solveTurnstile()).solved; })) {
             return text(await this._page_state(tab));
           }
@@ -2323,7 +2432,7 @@ export class McpServer {
             throw new Error("fields is empty.");
           }
           const done: string[] = [];
-          let last_text = null as Element | null;
+          let last_text = null as string | null;
           let stopped = false;
           const fill = async (): Promise<void> => {
           for (const field of fields) {
@@ -2345,7 +2454,7 @@ export class McpServer {
             } else {
               const value = this._fill_secrets(String(field.value));
               await element.type({ text: value, clear: true });
-              last_text = element;
+              last_text = ref;
               done.push(`${ref}: typed ${value.length} chars`);
             }
             await tab.sleep({ milliseconds: 250 });
@@ -2362,7 +2471,10 @@ export class McpServer {
             done.push("submit ignored: no text field to press Enter in — click the submit button instead.");
           }
           if (args.submit && last_text) {
-            const submit_element = last_text;
+            // Re-resolved: a select/checkbox filled after the text field can
+            // invalidate the DOM node ids it was found with ("Could not find
+            // node with given id" on Enter).
+            const submit_element = await this._element(tab, last_text);
             if (await this._act(tab, () => submit_element.pressKey({ key: "Enter" }))) {
               return text(`${done.join("\n")}\n\n${await this._page_state(tab)}`);
             }
@@ -2476,7 +2588,20 @@ export class McpServer {
           const tab = await this._ready_tab();
           let value: unknown;
           // alert() in the expression (manual mode) would block until timeout.
-          if (await this._act(tab, async () => { value = await tab.evaluate({ expression: String(args.expression), world: args.world === "main" ? "main" : "isolated" }); })) {
+          let dialog: boolean;
+          try {
+            dialog = await this._act(tab, async () => { value = await tab.evaluate({ expression: String(args.expression), world: args.world === "main" ? "main" : "isolated" }); });
+          } catch (error) {
+            // The thrown message can come from page code: keep it fenced.
+            const message = String((error as Error)?.message ?? error);
+            const js = /^JavaScript error: ([\s\S]*)$/.exec(message);
+            if (js) {
+              throw new Error(`JavaScript error:
+${this._untrusted(this._clip_redacted(js[1], 2_000))}`);
+            }
+            throw error;
+          }
+          if (dialog) {
             return text(await this._page_state(tab));
           }
           // The expression may have navigated (location.href = …).

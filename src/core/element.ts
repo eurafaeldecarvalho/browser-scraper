@@ -20,12 +20,38 @@ export class Element {
     selector = "",
     session_id: string | null = null,
     iframe_offset: [number, number] | null = null,
+    backend_node_id: number | null = null,
   ) {
     this._cdp = cdp;
     this._node_id = node_id;
+    this._backend_node_id = backend_node_id;
     this._selector = selector;
     this._session_id = session_id;
     this._iframe_offset = iframe_offset ?? [0, 0];
+  }
+
+  // A nodeId dies whenever anyone calls DOM.getDocument on the session again
+  // (every byRef / find does), so an Element kept across another lookup — the
+  // text field fill_form presses Enter in after filling a select, a drag
+  // source resolved before its target — would fail with "Could not find node
+  // with given id". The backend id survives that; prefer it when known.
+  private _node_params(): { backendNodeId: number } | { nodeId: number } {
+    return this._backend_node_id ? { backendNodeId: this._backend_node_id } : { nodeId: this._node_id };
+  }
+
+  // For the few DOM methods that only take a nodeId.
+  private async _live_node_id(): Promise<number> {
+    if (!this._backend_node_id) {
+      return this._node_id;
+    }
+    const pushed = await this._cdp
+      .send("DOM.pushNodesByBackendIdsToFrontend", { backendNodeIds: [this._backend_node_id] }, this._session_id)
+      .catch(() => null);
+    const node_id = Number(pushed?.nodeIds?.[0] ?? 0);
+    if (node_id) {
+      this._node_id = node_id;
+    }
+    return this._node_id;
   }
 
   private async _resolve_object(): Promise<string> {
@@ -36,7 +62,7 @@ export class Element {
     const result = await this._cdp.send(
       "DOM.resolveNode",
       {
-        nodeId: this._node_id,
+        ...this._node_params(),
       },
       this._session_id,
     );
@@ -54,7 +80,7 @@ export class Element {
       const result = await this._cdp.send(
         "DOM.getBoxModel",
         {
-          nodeId: this._node_id,
+          ...this._node_params(),
         },
         this._session_id,
       );
@@ -127,7 +153,7 @@ export class Element {
       const quads_result = await this._cdp.send(
         "DOM.getContentQuads",
         {
-          nodeId: this._node_id,
+          ...this._node_params(),
         },
         this._session_id,
       );
@@ -368,7 +394,7 @@ export class Element {
     await this._cdp.send(
       "DOM.focus",
       {
-        nodeId: this._node_id,
+        ...this._node_params(),
       },
       this._session_id,
     );
@@ -416,7 +442,7 @@ export class Element {
     const result = await this._cdp.send(
       "DOM.getOuterHTML",
       {
-        nodeId: this._node_id,
+        ...this._node_params(),
       },
       this._session_id,
     );
@@ -428,7 +454,7 @@ export class Element {
     const result = await this._cdp.send(
       "DOM.getAttributes",
       {
-        nodeId: this._node_id,
+        nodeId: await this._live_node_id(),
       },
       this._session_id,
     );
@@ -447,7 +473,7 @@ export class Element {
     await this._cdp.send(
       "DOM.setAttributeValue",
       {
-        nodeId: this._node_id,
+        nodeId: await this._live_node_id(),
         name,
         value,
       },
@@ -693,7 +719,7 @@ export class Element {
       "DOM.setFileInputFiles",
       {
         files,
-        nodeId: this._node_id,
+        ...this._node_params(),
       },
       this._session_id,
     );

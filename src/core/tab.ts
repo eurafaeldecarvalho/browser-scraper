@@ -1015,7 +1015,7 @@ export class Tab {
         });
 
         if (result.exceptionDetails) {
-          throw new Error(`JavaScript error: ${String(result.exceptionDetails.text ?? "Unknown error")}`);
+          throw new Error(`JavaScript error: ${js_exception_message(result.exceptionDetails)}`);
         }
 
         return result.result?.value;
@@ -1056,7 +1056,7 @@ export class Tab {
         });
 
         if (result.exceptionDetails) {
-          throw new Error(`JavaScript error: ${String(result.exceptionDetails.text ?? "Unknown error")}`);
+          throw new Error(`JavaScript error: ${js_exception_message(result.exceptionDetails)}`);
         }
 
         return result.result?.value;
@@ -1960,7 +1960,7 @@ export class Tab {
     }
 
     const offset = entry.targetId ? await this._get_iframe_offset_for_target(entry.targetId) : null;
-    return new Element(this._cdp, node_id, `ref=${key}`, entry.sessionId, offset);
+    return new Element(this._cdp, node_id, `ref=${key}`, entry.sessionId, offset, entry.backendNodeId);
   }
 
   // Role + accessible name of a ref from the latest snapshot, e.g. for logging
@@ -2716,4 +2716,19 @@ function real_turnstile_token(value: string): string | null {
 
 function normalize_ref(ref: string): string {
   return ref.replace(/^\[?(ref=)?/, "").replace(/\]$/, "").trim();
+}
+
+// CDP puts the useful part ("Error: boom") in exception.description; `text`
+// is only "Uncaught". Stack frames are dropped (they point into the eval).
+export function js_exception_message(details: Record<string, any>): string {
+  const exception = details?.exception ?? {};
+  const description = typeof exception.description === "string" ? exception.description : "";
+  const head = description.split("\n").filter((line: string) => !/^\s+at /.test(line)).join("\n").trim();
+  if (head) {
+    return head.slice(0, 2_000);
+  }
+  if (exception.value !== undefined) {
+    return `Uncaught ${JSON.stringify(exception.value)}`.slice(0, 2_000);
+  }
+  return String(details?.text ?? "Unknown error");
 }
