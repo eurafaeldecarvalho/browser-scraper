@@ -404,7 +404,9 @@ describe("mcp server hard-killed (e2e)", { skip: chrome ? false : "Chrome not fo
     // A detached Chrome (outside any job object, like one left by a server killed
     // from outside its process tree) holding the profile, with a sidecar naming
     // an owner that has exited.
-    const orphan = spawn(chrome as string, ["--headless=new", "--no-first-run", "--no-default-browser-check", arg, "about:blank"], { detached: true, stdio: "ignore", windowsHide: true });
+    const port = 40000 + Math.floor(Math.random() * 20000);
+    const spawned_at = Date.now();
+    const orphan = spawn(chrome as string, ["--headless=new", "--no-first-run", "--no-default-browser-check", `--remote-debugging-port=${port}`, arg, "about:blank"], { detached: true, stdio: "ignore", windowsHide: true });
     orphan.unref();
     try {
       for (let i = 0; i < 50 && !profileInUse(profile); i++) {
@@ -414,7 +416,7 @@ describe("mcp server hard-killed (e2e)", { skip: chrome ? false : "Chrome not fo
       const orphan_pid = orphan.pid as number;
 
       // 1) owner alive (this test process) -> the new server must refuse and leave that Chrome alone
-      writeFileSync(join(profile, OWNER_FILE), JSON.stringify({ ownerPid: process.pid, ownerStartedAt: Math.round(Date.now() - process.uptime() * 1000), chromePid: orphan_pid, userDataDirArg: arg }));
+      writeFileSync(join(profile, OWNER_FILE), JSON.stringify({ ownerPid: process.pid, ownerStartedAt: Math.round(Date.now() - process.uptime() * 1000), chromePid: orphan_pid, chromeStartedAt: spawned_at, debugPort: port, userDataDirArg: arg }));
       client = await start_client(["--user-data-dir", profile, "--allowed-domains", "127.0.0.1"]);
       let out = await client.tool("navigate", { url: `${server.origin}/products` });
       assert.equal(out.isError, true, out.text);
@@ -425,7 +427,7 @@ describe("mcp server hard-killed (e2e)", { skip: chrome ? false : "Chrome not fo
 
       // 2) owner dead -> the new server kills the orphan tree and launches
       const dead = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
-      writeFileSync(join(profile, OWNER_FILE), JSON.stringify({ ownerPid: Number(dead.stdout), ownerStartedAt: Date.now() - 60_000, chromePid: orphan_pid, userDataDirArg: arg }));
+      writeFileSync(join(profile, OWNER_FILE), JSON.stringify({ ownerPid: Number(dead.stdout), ownerStartedAt: Date.now() - 60_000, chromePid: orphan_pid, chromeStartedAt: spawned_at, debugPort: port, userDataDirArg: arg }));
       client = await start_client(["--user-data-dir", profile, "--allowed-domains", "127.0.0.1"]);
       out = await client.tool("navigate", { url: `${server.origin}/products` });
       assert.equal(out.isError, false, out.text);

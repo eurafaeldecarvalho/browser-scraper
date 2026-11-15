@@ -102,9 +102,9 @@ test("find_option matches options in a snapshot, exact before partial", () => {
 test("findOrphanChrome only reclaims our Chrome when its owning server is dead", () => {
   const dir = mkdtempSync(join(tmpdir(), "bs-owner-"));
   const arg = `--user-data-dir=${dir}`;
-  const owner = { ownerPid: 111, ownerStartedAt: 1_000_000, chromePid: 222, userDataDirArg: arg };
+  const owner = { ownerPid: 111, ownerStartedAt: 1_000_000, chromePid: 222, chromeStartedAt: 1_000_400, debugPort: 41234, userDataDirArg: arg };
   writeFileSync(join(dir, OWNER_FILE), JSON.stringify(owner));
-  const chrome = { startedAt: 1_000_500, commandLine: `chrome.exe --flag ${arg} about:blank` };
+  const chrome = { startedAt: 1_000_500, commandLine: `chrome.exe --flag --remote-debugging-port=41234 ${arg} about:blank` };
   const procs = (table: Record<number, { startedAt: number | null; commandLine: string } | null>) => (pid: number) => table[pid] ?? null;
   // owner dead + our browser process alive -> orphan
   assert.equal(findOrphanChrome(dir, procs({ 222: chrome })), 222);
@@ -118,7 +118,27 @@ test("findOrphanChrome only reclaims our Chrome when its owning server is dead",
   assert.equal(findOrphanChrome(dir, procs({ 222: { startedAt: 1, commandLine: `chrome.exe ${arg}2 about:blank` } })), null);
   assert.equal(findOrphanChrome(dir, procs({ 222: { startedAt: 1, commandLine: "chrome.exe --user-data-dir=C:/Other" } })), null);
   // a helper (--type=renderer) is not the browser process
-  assert.equal(findOrphanChrome(dir, procs({ 222: { startedAt: 1, commandLine: `chrome.exe --type=renderer ${arg}` } })), null);
+  assert.equal(findOrphanChrome(dir, procs({ 222: { ...chrome, commandLine: `${chrome.commandLine} --type=renderer` } })), null);
+  // chrome pid reused by a Chrome opened by hand later on the SAME profile -> never kill
+  assert.equal(findOrphanChrome(dir, procs({ 222: { ...chrome, startedAt: 9_000_000 } })), null);
+  assert.equal(findOrphanChrome(dir, procs({ 222: { ...chrome, startedAt: null } })), null);
+  // same profile, right start time, but no/other debugging port (hand-launched) -> never kill
+  assert.equal(findOrphanChrome(dir, procs({ 222: { ...chrome, commandLine: `chrome.exe ${arg}` } })), null);
+  assert.equal(findOrphanChrome(dir, procs({ 222: { ...chrome, commandLine: `chrome.exe --remote-debugging-port=412345 ${arg}` } })), null);
+  // planted sidecar naming ANOTHER profile's Chrome (e.g. the user's personal one) -> never kill
+  const personal = "--user-data-dir=C:/Users/me/AppData/Local/Google/Chrome/User Data";
+  writeFileSync(join(dir, OWNER_FILE), JSON.stringify({ ...owner, userDataDirArg: personal }));
+  assert.equal(findOrphanChrome(dir, procs({ 222: { ...chrome, commandLine: `chrome.exe --remote-debugging-port=41234 "${personal}"` } })), null);
+  // sidecar from an older version (no chromeStartedAt/debugPort) -> never kill
+  writeFileSync(join(dir, OWNER_FILE), JSON.stringify({ ownerPid: 111, ownerStartedAt: 1_000_000, chromePid: 222, userDataDirArg: arg }));
+  assert.equal(findOrphanChrome(dir, procs({ 222: chrome })), null);
+  // case/slash differences in the profile path on Windows still match
+  if (process.platform === "win32") {
+    const variant = `--user-data-dir=${dir.replace(/\\/g, "/").toUpperCase()}`;
+    writeFileSync(join(dir, OWNER_FILE), JSON.stringify({ ...owner, userDataDirArg: variant }));
+    assert.equal(findOrphanChrome(dir, procs({ 222: { ...chrome, commandLine: `chrome.exe --remote-debugging-port=41234 ${variant}` } })), 222);
+  }
+  writeFileSync(join(dir, OWNER_FILE), JSON.stringify(owner));
   // chrome already gone, malformed or missing sidecar -> nothing to do
   assert.equal(findOrphanChrome(dir, procs({})), null);
   writeFileSync(join(dir, OWNER_FILE), "{not json");

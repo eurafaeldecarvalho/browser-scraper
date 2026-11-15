@@ -3,7 +3,7 @@ import { closeSync, existsSync, openSync, readFileSync, readlinkSync, rmSync, wr
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { defaultWebglForPlatform, geoForCountry, platformFromUA, type GeoProfile } from "../stealth/persona";
@@ -120,8 +120,20 @@ export type ProfileOwner = {
   ownerPid: number;
   ownerStartedAt: number;
   chromePid: number;
+  // ms epoch when we spawned that Chrome: guards against its pid being reused
+  // (e.g. by a Chrome the user later opens by hand on the same profile).
+  chromeStartedAt: number;
+  // Our --remote-debugging-port: a hand-launched Chrome never carries it.
+  debugPort: number;
   userDataDirArg: string;
 };
+
+// Canonical form of a profile path for comparisons (absolute; case- and
+// slash-insensitive on Windows).
+function canon_dir(dir: string): string {
+  const abs = resolve(dir).replace(/[\\/]+$/, "");
+  return process.platform === "win32" ? abs.replace(/\//g, "\\").toLowerCase() : abs;
+}
 
 type ProcInfo = { startedAt: number | null; commandLine: string };
 
@@ -166,7 +178,14 @@ export function processInfo(pid: number): ProcInfo | null {
 export function readProfileOwner(dir: string): ProfileOwner | null {
   try {
     const data = JSON.parse(readFileSync(join(dir, OWNER_FILE), "utf8"));
-    if (Number.isInteger(data?.ownerPid) && Number.isInteger(data?.chromePid) && typeof data?.ownerStartedAt === "number" && typeof data?.userDataDirArg === "string") {
+    if (
+      Number.isInteger(data?.ownerPid) && data.ownerPid > 0 &&
+      Number.isInteger(data?.chromePid) && data.chromePid > 0 &&
+      Number.isFinite(data?.ownerStartedAt) &&
+      Number.isFinite(data?.chromeStartedAt) &&
+      Number.isInteger(data?.debugPort) && data.debugPort > 0 && data.debugPort < 65536 &&
+      typeof data?.userDataDirArg === "string"
+    ) {
       return data as ProfileOwner;
     }
   } catch {
@@ -187,7 +206,13 @@ const OWNER_START_TOLERANCE_MS = 5_000;
 // a Chrome whose server is alive, or the user's own Chrome, is never touched.
 export function findOrphanChrome(dir: string, info: (pid: number) => ProcInfo | null = processInfo): number | null {
   const owner = readProfileOwner(dir);
-  if (!owner || owner.ownerPid === process.pid) {
+  if (!owner || owner.ownerPid === process.pid || owner.chromePid === process.pid) {
+    return null;
+  }
+  // The sidecar must describe THIS profile: a planted/copied file naming
+  // another profile's Chrome (e.g. the user's personal one) is ignored.
+  const prefix = "--user-data-dir=";
+  if (!owner.userDataDirArg.startsWith(prefix) || canon_dir(owner.userDataDirArg.slice(prefix.length)) !== canon_dir(dir)) {
     return null;
   }
   const server = info(owner.ownerPid);
@@ -197,7 +222,12 @@ export function findOrphanChrome(dir: string, info: (pid: number) => ProcInfo | 
     }
   }
   const chrome = info(owner.chromePid);
-  if (!chrome || !chrome.commandLine) {
+  if (!chrome || !chrome.commandLine || chrome.startedAt === null) {
+    return null;
+  }
+  // pid reused by a process started at another time (a Chrome opened by hand
+  // later on, anything else) -> not ours.
+  if (Math.abs(chrome.startedAt - owner.chromeStartedAt) > OWNER_START_TOLERANCE_MS) {
     return null;
   }
   const cmd = process.platform === "win32" ? chrome.commandLine.toLowerCase() : chrome.commandLine;
@@ -209,6 +239,10 @@ export function findOrphanChrome(dir: string, info: (pid: number) => ProcInfo | 
   const end = cmd.indexOf(arg) + arg.length;
   const next = cmd.charAt(end);
   if (next && !/[\s"]/.test(next)) {
+    return null;
+  }
+  // Launched by us: carries our exact --remote-debugging-port.
+  if (!new RegExp(`(^|[\\s"])--remote-debugging-port=${owner.debugPort}(?=[\\s"]|$)`).test(cmd)) {
     return null;
   }
   return owner.chromePid;
@@ -655,10 +689,14 @@ export class Browser {
     });
     this._attach_stderr_capture();
     this._install_exit_guard();
-    this._write_owner_file();
+    this._chrome_spawned_at = Date.now();
 
     try {
       this._ws_endpoint = await this._get_ws_endpoint();
+      // Only now does this Chrome provably hold the profile (a racing second
+      // launch hands off and exits before an endpoint appears), so never
+      // overwrite another live server's sidecar.
+      this._write_owner_file();
     } catch (error) {
       // Launch failed (e.g. Chrome died under a Lambda seccomp/OOM). Tear down the
       // half-spawned process + temp profile so a retry starts clean and neither
@@ -781,6 +819,8 @@ export class Browser {
   }
 
   private _owner_file: string | null = null;
+  private _owner_record = "";
+  private _chrome_spawned_at = 0;
 
   // Records (owner Node pid + start time, Chrome pid) in the persistent
   // profile so a later launch can reclaim this Chrome if we get hard-killed.
@@ -795,11 +835,18 @@ export class Browser {
       ownerPid: globalThis.process.pid,
       ownerStartedAt: Math.round(Date.now() - globalThis.process.uptime() * 1000),
       chromePid: pid,
+      chromeStartedAt: this._chrome_spawned_at,
+      debugPort: this._debug_port,
       userDataDirArg: `--user-data-dir=${this.userDataDir}`,
     };
     try {
-      writeFileSync(file, JSON.stringify(owner));
+      // Unlink first and create exclusively: never write THROUGH a symlink or
+      // junction planted at the sidecar path.
+      rmSync(file, { force: true });
+      const record = JSON.stringify(owner);
+      writeFileSync(file, record, { flag: "wx" });
       this._owner_file = file;
+      this._owner_record = record;
     } catch {
       // Best effort: without it an orphan just yields the "in use" error.
     }
@@ -808,7 +855,10 @@ export class Browser {
   private _remove_owner_file(): void {
     if (this._owner_file) {
       try {
-        rmSync(this._owner_file, { force: true });
+        // Only delete our own record (another server may own it by now).
+        if (readFileSync(this._owner_file, "utf8") === this._owner_record) {
+          rmSync(this._owner_file, { force: true });
+        }
       } catch {
         // ignore
       }
