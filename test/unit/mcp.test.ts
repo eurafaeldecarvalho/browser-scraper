@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { McpServer, parseEnvFile, profileInUse } from "../../src/index";
 import { parseKeyCombo } from "../../src/behavior/keyboard";
-import { find_option, read_session_file, safe_filename, wait_timeout_ms } from "../../src/mcp/server";
+import { find_option, installShutdownHandlers, read_session_file, safe_filename, wait_timeout_ms } from "../../src/mcp/server";
 import { CDPClient, runUnguarded } from "../../src/core/cdp-client";
 
 test("initialize negotiates the protocol and advertises tools", async () => {
@@ -587,4 +587,35 @@ test("serve still closes when the input stream errors", async () => {
   input.destroy(new Error("stdin broke"));
   await served;
   assert.equal(closed, true);
+});
+
+test("after shutdown no tool call launches Chrome (call racing a SIGTERM)", async () => {
+  const server = new McpServer({ browserOptions: { chromePath: "C:/definitely/not/chrome.exe" } });
+  await server.shutdown();
+  assert.equal(server.isShutDown, true);
+  const response = await server.handle({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "navigate", arguments: { url: "https://example.com" } } });
+  assert.equal(response.result.isError, true);
+  assert.match(response.result.content[0].text, /shutting down/);
+});
+
+test("signal handlers close the browser before exiting; a second signal forces exit", async () => {
+  let shutdowns = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const exits: number[] = [];
+  const uninstall = installShutdownHandlers({ shutdown: async () => { shutdowns++; await gate; } }, (code) => exits.push(code));
+  try {
+    process.emit("SIGTERM", "SIGTERM");
+    assert.equal(shutdowns, 1);
+    assert.deepEqual(exits, []);
+    process.emit("SIGINT", "SIGINT");
+    assert.deepEqual(exits, [130]);
+    release();
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(exits, [130, 143]);
+    assert.equal(shutdowns, 1);
+  } finally {
+    uninstall();
+  }
 });

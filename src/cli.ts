@@ -3,7 +3,7 @@ import { writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 
 import { Browser, type BrowserOptions } from "./core/browser";
-import { McpServer, parseEnvFile } from "./mcp/server";
+import { installShutdownHandlers, McpServer, parseEnvFile } from "./mcp/server";
 import { scrape, ScrapeError, type ScrapeFormat } from "./scrape";
 import { __version__ } from "./index";
 

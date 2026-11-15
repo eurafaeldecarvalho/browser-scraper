@@ -547,6 +547,7 @@ export class Browser {
         // already gone
       }
       this._process = null;
+      this._remove_exit_guard();
     }
     if (this._temp_dir) {
       await rm(this._temp_dir, { recursive: true, force: true }).catch(() => {});
@@ -612,6 +613,42 @@ export class Browser {
     if (this._temp_dir) {
       await removeProfileDir(this._temp_dir);
       this._temp_dir = null;
+    }
+  }
+
+  private _exit_guard: (() => void) | null = null;
+
+  // Last resort when Node exits without close() (uncaught exception,
+  // process.exit elsewhere): synchronously kill Chrome so it isn't orphaned
+  // holding the profile lock.
+  private _install_exit_guard(): void {
+    this._remove_exit_guard();
+    const child = this._process;
+    if (!child) {
+      return;
+    }
+    const guard = (): void => {
+      if (child.exitCode !== null || child.signalCode !== null || !child.pid) {
+        return;
+      }
+      try {
+        if (globalThis.process.platform === "win32") {
+          spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+        } else {
+          child.kill("SIGKILL");
+        }
+      } catch {
+        // Exiting anyway.
+      }
+    };
+    globalThis.process.once("exit", guard);
+    this._exit_guard = guard;
+  }
+
+  private _remove_exit_guard(): void {
+    if (this._exit_guard) {
+      globalThis.process.off("exit", this._exit_guard);
+      this._exit_guard = null;
     }
   }
 

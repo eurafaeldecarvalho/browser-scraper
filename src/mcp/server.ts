@@ -197,13 +197,29 @@ export class McpServer {
     } finally {
       // Also on a stdin error: never leave Chrome behind on the profile.
       await Promise.all(pending);
-      await this.close();
+      await this.shutdown();
       this._out.off?.("error", on_output_error);
       input.off?.("error", on_input_error);
     }
   }
 
+  private _shut_down = false;
+
+  // Final stop (signal, console close, client gone): no call may launch a
+  // Chrome after this, including a relaunch already in flight.
+  async shutdown(): Promise<void> {
+    this._shut_down = true;
+    await this.close();
+  }
+
+  get isShutDown(): boolean {
+    return this._shut_down;
+  }
+
   async close(): Promise<void> {
+    // A launch in flight would otherwise spawn Chrome after we closed it,
+    // orphaning it on the profile.
+    await this._launching?.catch(() => undefined);
     await this._browser_cdp?.disconnect().catch(() => undefined);
     this._browser_cdp = null;
     if (this._browser) {
@@ -549,11 +565,17 @@ export class McpServer {
   // the next call into a second launch on the same Browser/profile.
   private async _launched_browser(): Promise<Browser> {
     this._assert_current();
+    if (this._shut_down) {
+      throw new Error("The MCP server is shutting down; the browser will not be (re)launched.");
+    }
     while (this._launching) {
       await this._launching.catch(() => undefined);
     }
     // The call may have been abandoned while it waited for another launch.
     this._assert_current();
+    if (this._shut_down) {
+      throw new Error("The MCP server is shutting down; the browser will not be (re)launched.");
+    }
     const browser = this._ensure_browser();
     if (browser.launched && this._browser_setup) {
       return browser;
@@ -2413,4 +2435,36 @@ export function read_session_file(raw_path: string): SessionFile {
 export function wait_timeout_ms(value: unknown): number {
   const requested = Number(value ?? 15);
   return Math.min(120, Math.max(0, Number.isFinite(requested) ? requested : 15)) * 1_000;
+}
+
+// Without these, SIGINT/SIGTERM (Hermes restarting the bot) or closing the
+// console window (SIGHUP/SIGBREAK on Windows) kills Node instantly and leaves
+// the headful Chrome running on the profile, so the next start fails with
+// "profile in use". Close the browser first; a second signal forces exit.
+export function installShutdownHandlers(server: { shutdown(): Promise<void> }, exit: (code: number) => void = (code) => process.exit(code)): () => void {
+  let stopping = false;
+  const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP", ...(process.platform === "win32" ? (["SIGBREAK"] as NodeJS.Signals[]) : [])];
+  const handler = (signal: NodeJS.Signals): void => {
+    const code = 128 + (signal === "SIGINT" ? 2 : signal === "SIGHUP" ? 1 : 15);
+    if (stopping) {
+      exit(code);
+      return;
+    }
+    stopping = true;
+    process.stderr.write(`[browser-scraper] ${signal}: closing the browser\n`);
+    const force = setTimeout(() => exit(code), 15_000);
+    force.unref?.();
+    void server.shutdown().catch(() => undefined).finally(() => {
+      clearTimeout(force);
+      exit(code);
+    });
+  };
+  for (const signal of signals) {
+    process.on(signal, handler);
+  }
+  return () => {
+    for (const signal of signals) {
+      process.off(signal, handler);
+    }
+  };
 }
