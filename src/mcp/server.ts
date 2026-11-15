@@ -161,9 +161,20 @@ export class McpServer {
 
   // Runs until the input stream ends.
   async serve(): Promise<void> {
-    const rl = createInterface({ input: this._options.input ?? process.stdin, crlfDelay: Infinity });
+    const input = this._options.input ?? process.stdin;
+    // The client (a bot) may die mid-call: writing its reply then fails with
+    // EPIPE, and an 'error' event without a listener is a fatal uncaught
+    // exception that would leave Chrome running and the profile locked.
+    const on_output_error = (): void => {
+      this._output_broken = true;
+    };
+    const on_input_error = (): void => undefined;
+    this._out.on?.("error", on_output_error);
+    input.on?.("error", on_input_error);
+    const rl = createInterface({ input, crlfDelay: Infinity });
     const pending = new Set<Promise<void>>();
 
+    try {
     for await (const line of rl) {
       if (!line.trim()) {
         continue;
@@ -183,9 +194,13 @@ export class McpServer {
       pending.add(task);
       void task.finally(() => pending.delete(task));
     }
-
-    await Promise.all(pending);
-    await this.close();
+    } finally {
+      // Also on a stdin error: never leave Chrome behind on the profile.
+      await Promise.all(pending);
+      await this.close();
+      this._out.off?.("error", on_output_error);
+      input.off?.("error", on_input_error);
+    }
   }
 
   async close(): Promise<void> {
@@ -443,7 +458,12 @@ export class McpServer {
     }
   }
 
+  private _output_broken = false;
+
   private _send(payload: unknown): void {
+    if (this._output_broken) {
+      return;
+    }
     this._out.write(`${JSON.stringify(payload)}\n`);
   }
 

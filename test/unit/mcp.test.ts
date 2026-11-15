@@ -553,3 +553,38 @@ test("cleanup sends that undo page state run unguarded (survive a stale call)", 
     assert.match(line, /runUnguarded\(/, line.trim());
   }
 });
+
+test("serve survives a broken output pipe (client died) and still shuts down", async () => {
+  const { PassThrough, Writable } = await import("node:stream");
+  const input = new PassThrough();
+  const output = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+    },
+  });
+  const server = new McpServer({ input, output });
+  const served = server.serve();
+  input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" })}\n`);
+  input.write(`${JSON.stringify({ jsonrpc: "2.0", id: 2, method: "ping" })}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  input.end();
+  await served;
+  assert.equal(output.listenerCount("error"), 0);
+});
+
+test("serve still closes when the input stream errors", async () => {
+  const { PassThrough } = await import("node:stream");
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const server = new McpServer({ input, output });
+  let closed = false;
+  const original = server.close.bind(server);
+  server.close = async () => {
+    closed = true;
+    await original();
+  };
+  const served = server.serve().catch(() => undefined);
+  input.destroy(new Error("stdin broke"));
+  await served;
+  assert.equal(closed, true);
+});
