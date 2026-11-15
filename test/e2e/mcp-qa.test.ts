@@ -168,4 +168,22 @@ describe("mcp QA regressions (e2e)", { skip: chrome ? false : "Chrome not found"
     assert.match(out.text, /Waited 30 s \(the maximum/);
     assert.ok(out.ms < 33_000, `${out.ms} ms`);
   });
+
+  // QA round 2: closing tabs back to back. Chrome still lists a tab closed a
+  // moment ago; close_tab activated it ("No page target"), the popup fallback
+  // then misreported it as "closed itself", and list_tabs minted a ghost id.
+  test("close_tab right after another close_tab returns to the remaining tab", async () => {
+    for (let round = 0; round < 10; round++) {
+      await tool("navigate", { url: `${origin}/plain` });
+      const a = /Tab: (t\d+)/.exec((await tool("new_tab", { url: `${origin}/plain` })).text)![1];
+      const b = /Tab: (t\d+)/.exec((await tool("new_tab", { url: `${origin}/plain` })).text)![1];
+      const first = await tool("close_tab", { id: a });
+      assert.match(first.text, /Current tab unchanged/);
+      const second = await tool("close_tab", {});
+      assert.equal(second.isError, false, second.text);
+      assert.match(second.text, new RegExp(`^Closed ${b}\\.\\n\\nTab: t\\d+`));
+      const listed = (await tool("list_tabs")).text;
+      assert.equal(listed.match(/^[* ] t\d/gm)?.length, 1, listed);
+    }
+  });
 });

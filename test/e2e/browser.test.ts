@@ -201,6 +201,11 @@ describe("browser (e2e)", { skip: chrome ? false : "Chrome not found" }, () => {
       assert.match(after_click, /clicked:\{\{EMAIL\}\}/);
       assert.doesNotMatch(after_click, /secret\.user@example\.org/);
       assert.match(await tool("markdown", { query: "price" }), /R\$ 19,90/);
+      // QA round 2: a GET form puts the secret URL-encoded in the address.
+      const encoded = await tool("navigate", { url: `${server.origin}/article?email=secret.user%40example.org` });
+      assert.doesNotMatch(encoded, /secret\.user%40example\.org/i);
+      assert.match(encoded, /email=\{\{EMAIL\}\}/);
+      assert.doesNotMatch(await tool("tab_info", {}), /secret\.user%40example/i);
       assert.match(await tool("navigate", { url: "https://example.com" }), /not in the allowed list/);
     } finally {
       child.stdin.end();

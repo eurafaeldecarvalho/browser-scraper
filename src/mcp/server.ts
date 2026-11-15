@@ -474,7 +474,8 @@ export class McpServer {
       // The page closed itself during the action (an OAuth/"Continue with
       // Google" popup posting its result and calling window.close()): that is
       // the action succeeding, not a failure. Fall back to another tab.
-      const closed = acting_on && this._browser.alive ? await this._closed_itself(acting_on) : null;
+      // close_tab closes the tab on purpose: its own errors are real.
+      const closed = acting_on && tool.name !== "close_tab" && this._browser.alive ? await this._closed_itself(acting_on) : null;
       if (closed) {
         return closed;
       }
@@ -503,7 +504,8 @@ export class McpServer {
   // tab is still there (the error was a real one).
   private async _closed_itself(target_id: string): Promise<ToolResult | null> {
     let pages: Array<{ id: string; targetId: string }>;
-    const id = this._tab_id_for(target_id);
+    // Look the id up without minting a new one for a target already forgotten.
+    const id = [...this._tab_ids].find(([, target]) => target === target_id)?.[0] ?? "the current tab";
     try {
       pages = await this._list_pages();
     } catch {
@@ -675,7 +677,9 @@ export class McpServer {
     let out = text;
     for (const [name, value] of Object.entries(this._options.secrets ?? {})) {
       if (value && value.length >= 3) {
-        out = out.split(value).join(`{{${name}}}`);
+        for (const form of secret_forms(value)) {
+          out = out.split(form).join(`{{${name}}}`);
+        }
       }
     }
     return out;
@@ -951,6 +955,8 @@ export class McpServer {
     }
   }
 
+  private readonly _closed_targets = new Set<string>();
+
   private _tab_id_for(target_id: string): string {
     for (const [id, target] of this._tab_ids) {
       if (target === target_id) {
@@ -976,6 +982,9 @@ export class McpServer {
       (target) =>
         target.type === "page" &&
         !this._startup_targets.has(String(target.id)) &&
+        // Closed through close_tab but still listed by Chrome for a moment:
+        // listing it would mint a ghost id for a tab that is going away.
+        !this._closed_targets.has(String(target.id)) &&
         !/^(devtools|chrome-extension|chrome-untrusted):/.test(String(target.url ?? "")),
     );
     const alive = new Set(pages.map((target) => String(target.id)));
@@ -2032,6 +2041,7 @@ export class McpServer {
           this._assert_current();
           this._tab_ids.delete(page.id);
           this._forget_target(page.targetId);
+          this._closed_targets.add(page.targetId);
           if (!was_current) {
             return text(`Closed ${page.id}. Current tab unchanged.`);
           }
@@ -2040,7 +2050,22 @@ export class McpServer {
           if (remaining.length === 0) {
             return text(`Closed ${page.id}. No tabs left — call navigate or new_tab.`);
           }
-          const next = await this._activate(remaining[remaining.length - 1].targetId);
+          // Chrome can still list a tab closed a moment ago (e.g. the previous
+          // close_tab): try the newest first and skip targets that are gone.
+          let next: Awaited<ReturnType<typeof this._activate>> | null = null;
+          for (const entry of remaining.reverse()) {
+            try {
+              next = await this._activate(entry.targetId);
+              break;
+            } catch (error) {
+              if (!/No page target/i.test(String((error as Error)?.message ?? error))) {
+                throw error;
+              }
+            }
+          }
+          if (!next) {
+            return text(`Closed ${page.id}. No tabs left — call navigate or new_tab.`);
+          }
           return text(`Closed ${page.id}.\n\n${await this._page_state(next)}`);
         },
       },
@@ -3813,6 +3838,35 @@ export async function finalize_download(dir: string, guid: string, suggested: st
     }
   }
   return from;
+}
+
+// A secret typed into a page comes back encoded as often as raw: in a GET
+// form's URL (%XX / "+"), a cookie, a JSON string from evaluate, an HTML
+// attribute. Redact every common encoding, longest first so a raw value that
+// is a substring of its encoded form cannot leave encoded leftovers.
+export function secret_forms(value: string): string[] {
+  const forms = new Set<string>([value]);
+  const add = (form: string) => {
+    if (form.length >= 3) {
+      forms.add(form);
+      forms.add(form.replace(/%[0-9A-F]{2}/g, (hex) => hex.toLowerCase()));
+    }
+  };
+  try {
+    add(encodeURIComponent(value));
+    add(encodeURIComponent(value).replace(/%20/g, "+"));
+    add(new URLSearchParams({ x: value }).toString().slice(2));
+    add(encodeURI(value));
+  } catch {
+    // lone surrogates: no URL form
+  }
+  add(JSON.stringify(value).slice(1, -1));
+  add(JSON.stringify(JSON.stringify(value).slice(1, -1)).slice(1, -1));
+  const html = value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  add(html.replace(/"/g, "&quot;"));
+  add(html.replace(/"/g, "&quot;").replace(/'/g, "&#39;"));
+  add(html.replace(/"/g, "&#34;").replace(/'/g, "&#39;"));
+  return [...forms].sort((a, b) => b.length - a.length);
 }
 
 // Default save_pdf file stem from the page title. Redaction must run before

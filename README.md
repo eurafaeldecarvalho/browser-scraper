@@ -261,7 +261,7 @@ Or in any MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, â
 
 - `--allowed-domains a.com,b.com` refuses navigation elsewhere, rolls back any action (click, key, form, `evaluate`, history) that leaves the list, refuses `switch_tab` to a popup outside it, and discards `scrape` results that redirected outside it.
 - Every tool call is bounded (180 s; longer for `scroll`, `scrape`, `wait_for_download`), so a frozen page cannot block the bot forever. Notes (auto-answered dialogs, popups, downloads) are capped and returned inside the untrusted markers.
-- `--secrets .env` lets the agent type `{{PASSWORD}}`. The value is filled in at keystroke time and redacted from everything returned.
+- `--secrets .env` lets the agent type `{{PASSWORD}}`. The value is filled in at keystroke time and redacted from everything returned (also its URL-encoded, JSON-escaped and HTML-escaped forms).
 - `--dialogs accept|dismiss|manual` decides how JS dialogs are answered (default `accept`; every auto-answer is reported). In `manual` mode the action returns as soon as a dialog opens and the agent answers it with `handle_dialog`; nothing hangs.
 - `--downloads-dir <dir>` is where `wait_for_download` finds files (saved under the site's file name).
 - `--snapshot-mode full|diff|none` sets what actions return: the full snapshot (default), only the lines that changed since the tab's last snapshot (`diff`; refs are stable, so unchanged elements keep theirs), or just the tab header (`none`; use `find`/`snapshot` when needed).
