@@ -139,6 +139,15 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
     const slid = Number(String(json((await tool("evaluate", { expression: "document.getElementById('slid').textContent" })).text)).split(":")[1]);
     assert.ok(slid > 120 && slid <= 270, `slider moved ${slid}`);
 
+    // A point refers to the viewport as it is: an off-screen element end must
+    // not be scrolled into view (the point would then hit something else).
+    await tool("evaluate", { expression: "scrollTo(0, 3000)" });
+    out = await tool("drag", { selector: "#knob", toX: 10, toY: 10 });
+    assert.equal(out.isError, true, out.text);
+    assert.match(out.text, /not visible in the viewport/);
+    assert.equal(json((await tool("evaluate", { expression: "scrollY > 1000" })).text), true, "drag must not scroll when a point is given");
+    await tool("evaluate", { expression: "scrollTo(0, 0)" });
+
     out = await tool("drag", { selector: "#card", toSelector: "#lane" });
     assert.equal(out.isError, false, out.text);
     assert.equal(json((await tool("evaluate", { expression: "document.getElementById('dnd').textContent" })).text), "dropped:card-1");
@@ -265,6 +274,14 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
     assert.match(out.text, /Browser: running/);
     assert.match(out.text, /Snapshot mode: diff/);
     assert.match(out.text, /JS heap: /);
+    // A frozen page must not hang the health check.
+    void tool("evaluate", { expression: "setTimeout(() => { const end = Date.now() + 6000; while (Date.now() < end); }, 50); 1", world: "main" });
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const started = Date.now();
+    out = await tool("browser_status", {});
+    assert.match(out.text, /Browser: running/);
+    assert.ok(Date.now() - started < 5_000, `browser_status took ${Date.now() - started} ms on a busy page`);
+    await new Promise((resolve) => setTimeout(resolve, 6000));
 
     out = await tool("batch", {
       steps: [

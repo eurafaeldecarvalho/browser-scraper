@@ -1148,7 +1148,7 @@ export class McpServer {
       if (!scroll) {
         // Measured after something else scrolled: it must still be on screen.
         await this._viewport_point(tab, box.x + box.width / 2, box.y + box.height / 2).catch(() => {
-          throw new Error(`${label} and the drop target are not both visible in the viewport; scroll so both are on screen, or use coordinates.`);
+          throw new Error(`${label} is not visible in the viewport: both ends of a drag must be on screen (scroll first; coordinates refer to the current viewport).`);
         });
       }
       return { x: box.x + box.width * (0.4 + Math.random() * 0.2), y: box.y + box.height * (0.4 + Math.random() * 0.2) };
@@ -2796,10 +2796,14 @@ export class McpServer {
         },
         run: async (args) => {
           const tab = await this._ready_tab();
-          const first = await this._point_of(tab, args.ref, args.selector, args.fromX, args.fromY, "drag source");
-          const to = await this._point_of(tab, args.toRef, args.toSelector, args.toX, args.toY, "drop target");
+          // Coordinates refer to the viewport as it is now (a screenshot): if
+          // either end is given as a point, nothing may scroll, or the point
+          // would land on another element.
+          const has_point = (!args.ref && !args.selector) || (!args.toRef && !args.toSelector);
+          const first = await this._point_of(tab, args.ref, args.selector, args.fromX, args.fromY, "drag source", !has_point);
+          const to = await this._point_of(tab, args.toRef, args.toSelector, args.toX, args.toY, "drop target", !has_point);
           // Scrolling the target into view may have moved the source: measure it again.
-          const from = args.ref || args.selector ? await this._point_of(tab, args.ref, args.selector, undefined, undefined, "drag source", false) : first;
+          const from = (args.ref || args.selector) && !has_point ? await this._point_of(tab, args.ref, args.selector, undefined, undefined, "drag source", false) : first;
           const drag = async (): Promise<void> => {
             await tab.mouse.moveTo(from);
             await delay(80 + Math.random() * 120);
@@ -3383,8 +3387,12 @@ export class McpServer {
             const current = this._tab?.target_id;
             lines.push(`Tabs: ${pages.length}${pages.length ? `\n${pages.map((page) => `  ${page.targetId === current ? "*" : " "} ${page.id} ${page.url}`).join("\n")}` : ""}`);
             if (this._tab && !this._pending_dialogs.has(this._tab.target_id)) {
-              const heap = await this._tab.cdp.send("Runtime.getHeapUsage").catch(() => null);
-              if (heap) {
+              // A frozen renderer (the case this tool is for) never answers.
+              const heap = await Promise.race([this._tab.cdp.send("Runtime.getHeapUsage").catch(() => null), delay(2_000).then(() => "timeout" as const)]);
+              if (heap === "timeout") {
+                lines.push("Current tab JS heap: no answer in 2 s (page busy or frozen — a while(true) loop, a renderer hang)");
+              }
+              if (heap && heap !== "timeout") {
                 lines.push(`Current tab JS heap: ${format_bytes(Number(heap.usedSize ?? 0))} used of ${format_bytes(Number(heap.totalSize ?? 0))}`);
               }
             }
