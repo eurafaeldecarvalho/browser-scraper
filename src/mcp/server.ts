@@ -602,10 +602,14 @@ export class McpServer {
       }
       // Stays "inProgress" until the file has its final name, so
       // wait_for_download never returns the GUID path mid-rename.
-      void finalize_download(this._downloads_dir, entry.guid, entry.suggestedFilename).then((path) => {
-        entry.path = path;
-        entry.state = "completed";
-      });
+      // Never rejects (see finalize_download), but a stray rejection here would
+      // be a fatal unhandledRejection and leave the entry inProgress forever.
+      void finalize_download(this._downloads_dir, entry.guid, entry.suggestedFilename)
+        .catch(() => join(this._downloads_dir, entry.guid))
+        .then((path) => {
+          entry.path = path;
+          entry.state = "completed";
+        });
     });
     await cdp.send("Browser.setDownloadBehavior", { behavior: "allowAndName", downloadPath: this._downloads_dir, eventsEnabled: true });
   }
@@ -2276,7 +2280,7 @@ export function find_option(snapshot: string, want: string): { ref: string; name
 // folder and finish a same-named download at once. On Windows the rename often
 // fails for a moment (EPERM/EBUSY) while antivirus or the indexer still holds
 // the fresh file, so it is retried before falling back to the GUID path.
-export async function finalize_download(dir: string, guid: string, suggested: string, rename: (from: string, to: string) => void = renameSync, retry_ms = 150, attempts = 10): Promise<string> {
+export async function finalize_download(dir: string, guid: string, suggested: string, rename: (from: string, to: string) => void = renameSync, retry_ms = 150, attempts = 10, remove: (path: string) => void = (path) => rmSync(path, { force: true })): Promise<string> {
   const from = join(dir, guid);
   const safe = safe_filename(suggested);
   const ext = extname(safe);
@@ -2298,7 +2302,13 @@ export async function finalize_download(dir: string, guid: string, suggested: st
           await delay(retry_ms);
           continue;
         }
-        rmSync(to, { force: true });
+        try {
+          // The empty placeholder can itself be locked on Windows; leaking it
+          // beats rejecting (fatal unhandledRejection in the event handler).
+          remove(to);
+        } catch {
+          // ignore
+        }
         return from;
       }
     }

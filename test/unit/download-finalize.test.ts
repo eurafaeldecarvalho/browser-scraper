@@ -42,3 +42,16 @@ test("finalize_download never overwrites a same-named file", async () => {
   assert.equal(path, join(dir, "a (1).txt"));
   assert.equal(readFileSync(join(dir, "a.txt"), "utf8"), "old");
 });
+
+test("finalize_download never rejects when the reserved placeholder cannot be removed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "bs-dl-"));
+  writeFileSync(join(dir, "guid-9"), "data");
+  const broken = () => {
+    throw Object.assign(new Error("nope"), { code: "ENOENT" });
+  };
+  const locked = () => {
+    throw Object.assign(new Error("locked"), { code: "EPERM" });
+  };
+  const path = await finalize_download(dir, "guid-9", "cv.pdf", broken, 1, 10, locked);
+  assert.equal(path, join(dir, "guid-9"));
+});
