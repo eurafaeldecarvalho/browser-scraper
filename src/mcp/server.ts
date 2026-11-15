@@ -605,6 +605,13 @@ export class McpServer {
     return out;
   }
 
+  // Clipping BEFORE redaction would leak a secret's prefix (the cut copy no
+  // longer contains the whole value, so _redact_result cannot find it).
+  private _clip_redacted(value: string, max: number): string {
+    const redacted = this._redact(value);
+    return redacted.length > max ? `${redacted.slice(0, max)}…` : redacted;
+  }
+
   private _redact_result(result: ToolResult): ToolResult {
     return {
       ...result,
@@ -1104,7 +1111,7 @@ export class McpServer {
   private _format_request(entry: NetEntry): string {
     const state = entry.state === "failed" ? `FAILED ${entry.error}` : entry.status ? String(entry.status) : "pending";
     const size = entry.size ? ` ${format_bytes(entry.size)}` : "";
-    return `${entry.id} ${this._tab_id_for(entry.targetId)} ${entry.method} ${state} ${entry.type}${entry.mimeType ? ` ${entry.mimeType}` : ""}${size} ${entry.url.length > 300 ? `${entry.url.slice(0, 300)}…` : entry.url}`;
+    return `${entry.id} ${this._tab_id_for(entry.targetId)} ${entry.method} ${state} ${entry.type}${entry.mimeType ? ` ${entry.mimeType}` : ""}${size} ${this._clip_redacted(entry.url, 300)}`;
   }
 
   private async _response_body(entry: NetEntry, max_chars: number): Promise<string> {
@@ -1136,6 +1143,7 @@ export class McpServer {
         // not JSON after all
       }
     }
+    body = this._redact(body);
     return body.length > max_chars ? `${body.slice(0, max_chars)}\n… [truncated ${body.length - max_chars} chars — raise maxChars]` : body;
   }
 
@@ -2906,24 +2914,34 @@ export class McpServer {
             fn: `function() {
               const clip = (v, n) => { v = String(v ?? ''); return v.length > n ? v.slice(0, n) + '…' : v; };
               const attributes = {};
-              for (const a of Array.from(this.attributes || [])) attributes[a.name] = clip(a.value, 300);
+              for (const a of Array.from(this.attributes || [])) attributes[a.name] = clip(a.value, 20000);
               const r = this.getBoundingClientRect();
               const style = getComputedStyle(this);
               const out = {
                 tag: this.tagName.toLowerCase(),
                 attributes,
-                text: clip((this.innerText ?? this.textContent ?? '').replace(/\\s+/g, ' ').trim(), 500),
+                text: clip((this.innerText ?? this.textContent ?? '').replace(/\\s+/g, ' ').trim(), 20000),
                 visible: !!(r.width || r.height) && style.visibility !== 'hidden' && style.display !== 'none',
                 enabled: !this.disabled && this.getAttribute('aria-disabled') !== 'true',
                 box: { x: Math.round(r.x), y: Math.round(r.y), width: Math.round(r.width), height: Math.round(r.height) },
               };
-              if ('value' in this && typeof this.value === 'string') out.value = clip(this.value, 500);
+              if ('value' in this && typeof this.value === 'string') out.value = clip(this.value, 20000);
               if ('checked' in this && (this.type === 'checkbox' || this.type === 'radio')) out.checked = this.checked;
               if (this.href) out.href = String(this.href);
               if (this.isContentEditable) out.contentEditable = true;
               return out;
             }`,
           });
+          // Clipped here, after redaction: a page-side cut would leave a typed
+          // secret's prefix that redaction can no longer recognise.
+          for (const [name, value] of Object.entries((info.attributes ?? {}) as Record<string, unknown>)) {
+            info.attributes[name] = this._clip_redacted(String(value), 300);
+          }
+          for (const [key, max] of [["text", 500], ["value", 500], ["href", 2_048]] as const) {
+            if (typeof info[key] === "string") {
+              info[key] = this._clip_redacted(info[key], max);
+            }
+          }
           if (element.sessionId) {
             info.box_note = "box is relative to its iframe";
           }
@@ -3061,7 +3079,7 @@ export class McpServer {
             }
             const lines = wanted.map((cookie) => {
               const expires = cookie.session || cookie.expires === -1 ? "session" : new Date(Number(cookie.expires) * 1_000).toISOString();
-              const value = String(cookie.value ?? "");
+              const value = this._redact(String(cookie.value ?? ""));
               return `${cookie.name}=${value.length > 80 ? `${value.slice(0, 80)}…(${value.length} chars)` : value}  domain=${cookie.domain} path=${cookie.path} expires=${expires}${cookie.httpOnly ? " httpOnly" : ""}${cookie.secure ? " secure" : ""}${cookie.sameSite ? ` sameSite=${cookie.sameSite}` : ""}`;
             });
             return text(`${wanted.length} cookie(s) for ${url}:\n${this._untrusted(lines.join("\n"))}`);
@@ -3364,7 +3382,7 @@ export class McpServer {
             } else {
               const first = result.content.find((part) => part.type === "text") as { text: string } | undefined;
               const summary = batch_step_summary(first?.text ?? "");
-              lines.push(`${index + 1}. ${tool.name}: ${result.isError ? "ERROR " : "ok"}${summary ? ` — ${summary.slice(0, 200)}` : ""}`);
+              lines.push(`${index + 1}. ${tool.name}: ${result.isError ? "ERROR " : "ok"}${summary ? ` — ${this._clip_redacted(summary, 200)}` : ""}`);
               extra.push(...result.content.filter((part) => part.type === "image"));
               // Bound what earlier steps hand back: 50 screenshots would be a
               // single response of tens of MB.
