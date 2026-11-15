@@ -7,7 +7,7 @@ import { test } from "node:test";
 
 import { findOrphanChrome, McpServer, OWNER_FILE, parseEnvFile, processInfo, profileInUse } from "../../src/index";
 import { parseKeyCombo } from "../../src/behavior/keyboard";
-import { batch_step_summary, clip_url, find_in_snapshot, find_option, local_path, format_bytes, installShutdownHandlers, mime_for, read_session_file, safe_filename, snapshot_diff, wait_timeout_ms } from "../../src/mcp/server";
+import { pdf_stem, batch_step_summary, clip_url, find_in_snapshot, find_option, local_path, format_bytes, installShutdownHandlers, mime_for, read_session_file, safe_filename, snapshot_diff, wait_timeout_ms } from "../../src/mcp/server";
 import { renderSnapshot } from "../../src/content/snapshot";
 import { CDPClient, runUnguarded } from "../../src/core/cdp-client";
 
@@ -113,6 +113,18 @@ test("download filenames redact secrets before the 180-char filename clip", () =
   const name = safe_filename((server as any)._downloads[0].suggestedFilename);
   assert.equal(name.includes(secret.slice(0, 30)), false);
   assert.match(name, /\{\{SESSION\}\}\.csv$/);
+});
+
+test("save_pdf default name redacts the title before the 120-char clip", () => {
+  const secret = "tok_" + "Z9y8X7w6".repeat(30);
+  const server = new McpServer({ secrets: { SESSION: secret } });
+  const raw = pdf_stem(`Report ${secret}`, (v) => v);
+  assert.equal(raw.includes(secret.slice(0, 30)), true); // unredacted clip keeps a prefix
+  const stem = pdf_stem(`Report ${secret}`, (v) => (server as any)._redact(v));
+  assert.equal(stem.includes(secret.slice(0, 10)), false);
+  assert.equal(stem, "Report {{SESSION}}");
+  assert.equal(pdf_stem("", (v) => v), "page");
+  assert.equal(pdf_stem("a/../b.pdf", (v) => v), "b");
 });
 
 test("untrusted wrapper cannot be closed from page content", () => {

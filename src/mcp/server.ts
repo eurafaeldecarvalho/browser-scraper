@@ -3139,7 +3139,7 @@ export class McpServer {
             }
           } else {
             mkdirSync(this._downloads_dir, { recursive: true });
-            const stem = safe_filename(this._redact((await tab.title().catch(() => "")) || "page")).replace(/\.pdf$/i, "").slice(0, 120) || "page";
+            const stem = pdf_stem((await tab.title().catch(() => "")) || "page", (value) => this._redact(value));
             path = join(this._downloads_dir, `${stem}.pdf`);
             for (let n = 1; existsSync(path); n++) {
               path = join(this._downloads_dir, `${stem} (${n}).pdf`);
@@ -3680,6 +3680,12 @@ export async function finalize_download(dir: string, guid: string, suggested: st
     }
   }
   return from;
+}
+
+// Default save_pdf file stem from the page title. Redaction must run before
+// the 120-char clip, or a title echoing a secret leaks its prefix in the path.
+export function pdf_stem(title: string, redact: (value: string) => string): string {
+  return safe_filename(redact(title || "page")).replace(/\.pdf$/i, "").slice(0, 120) || "page";
 }
 
 // Download names come from the site: keep only a plain file name that Windows
