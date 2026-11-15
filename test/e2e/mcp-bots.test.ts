@@ -341,8 +341,6 @@ describe("mcp red team over stdio (e2e)", { skip: chrome ? false : "Chrome not f
   });
 });
 
-// Main Chrome process for a profile: the one whose command line has the
-// user-data-dir and no --type= (helpers carry --type=renderer/gpu/…).
 describe("mcp server hard-killed (e2e)", { skip: chrome ? false : "Chrome not found" }, () => {
   test("launch installs the exit guard and owner sidecar; close removes both", async () => {
     const profile = mkdtempSync(join(tmpdir(), "bs-guard-profile-"));
@@ -450,6 +448,8 @@ describe("mcp server hard-killed (e2e)", { skip: chrome ? false : "Chrome not fo
   });
 });
 
+// Main Chrome process for a profile: the one whose command line has the
+// user-data-dir and no --type= (helpers carry --type=renderer/gpu/…).
 async function find_chrome_pid(profile: string): Promise<number | null> {
   const { execSync } = await import("node:child_process");
   if (process.platform === "win32") {

@@ -595,25 +595,26 @@ export class McpServer {
   }
 
   private async _launch(browser: Browser): Promise<Browser> {
-    {
-      this._browser_setup = true;
-      try {
-        await browser.launch();
-      } catch (error) {
-        this._browser_setup = false;
-        throw error;
-      }
+    this._browser_setup = true;
+    try {
+      await browser.launch();
       for (const target of await browser.getTabs()) {
         if (target.type === "page") {
           this._startup_targets.add(String(target.id));
         }
       }
-      this._downloads_error = null;
-      await this._setup_downloads().catch((error) => {
-        this._downloads_error = String(error?.message ?? error);
-        process.stderr.write(`[browser-scraper mcp] downloads disabled: ${String(error?.message ?? error)}\n`);
-      });
+    } catch (error) {
+      // Also when the target list failed after a good launch: the next call
+      // must redo the setup (startup page hidden, downloads wired) instead of
+      // treating a half-set-up browser as ready.
+      this._browser_setup = false;
+      throw error;
     }
+    this._downloads_error = null;
+    await this._setup_downloads().catch((error) => {
+      this._downloads_error = String(error?.message ?? error);
+      process.stderr.write(`[browser-scraper mcp] downloads disabled: ${String(error?.message ?? error)}\n`);
+    });
     return browser;
   }
 

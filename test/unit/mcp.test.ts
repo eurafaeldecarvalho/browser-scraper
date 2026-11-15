@@ -430,6 +430,18 @@ test("a failed launch is retried on the next call", async () => {
   assert.equal(launches, 2);
 });
 
+test("a target-list failure right after launch makes the next call redo the setup", async () => {
+  const server = new McpServer() as any;
+  let lists = 0;
+  const browser = { launched: false, launch: async () => { browser.launched = true; }, getTabs: async () => { lists++; if (lists === 1) throw new Error("fetch failed"); return [{ type: "page", id: "STARTUP" }]; }, wsEndpoint: null };
+  server._browser = browser;
+  await assert.rejects(server._launched_browser(), /fetch failed/);
+  assert.equal(server._browser_setup, false);
+  await server._launched_browser();
+  assert.equal(lists, 2);
+  assert.ok(server._startup_targets.has("STARTUP"));
+});
+
 // Runs `body` inside a call that has timed out and been abandoned.
 async function in_abandoned_call(server: any, body: () => Promise<unknown>): Promise<unknown> {
   let release!: () => void;
