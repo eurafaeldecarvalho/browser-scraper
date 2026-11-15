@@ -752,7 +752,7 @@ export class McpServer {
       }
       this._downloads.splice(Math.max(0, index), 1);
     }
-    this._downloads.push({ guid: String(p.guid), url: String(p.url ?? ""), suggestedFilename: String(p.suggestedFilename ?? "download"), state: "inProgress", path: null, reported: false, noted: false });
+    this._downloads.push({ guid: String(p.guid), url: String(p.url ?? ""), suggestedFilename: this._redact(String(p.suggestedFilename ?? "download")), state: "inProgress", path: null, reported: false, noted: false });
   }
 
   // Per-tab hooks, installed once per page target: dialogs.
@@ -3139,7 +3139,7 @@ export class McpServer {
             }
           } else {
             mkdirSync(this._downloads_dir, { recursive: true });
-            const stem = safe_filename(`${(await tab.title().catch(() => "")) || "page"}`).replace(/\.pdf$/i, "").slice(0, 120) || "page";
+            const stem = safe_filename(this._redact((await tab.title().catch(() => "")) || "page")).replace(/\.pdf$/i, "").slice(0, 120) || "page";
             path = join(this._downloads_dir, `${stem}.pdf`);
             for (let n = 1; existsSync(path); n++) {
               path = join(this._downloads_dir, `${stem} (${n}).pdf`);
