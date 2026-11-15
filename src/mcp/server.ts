@@ -1041,7 +1041,9 @@ export class McpServer {
       }
     } finally {
       tab.cdp.off("Page.fileChooserOpened", on_chooser!);
-      await tab.cdp.send("Page.setInterceptFileChooserDialog", { enabled: false }, session).catch(() => undefined);
+      // Cleanup: must run even if the call went stale meanwhile, or the page
+      // keeps swallowing every file chooser.
+      await runUnguarded(() => tab.cdp.send("Page.setInterceptFileChooserDialog", { enabled: false }, session)).catch(() => undefined);
     }
 
     // Fall back to the page's file input only when it is unambiguous: with
@@ -2232,7 +2234,7 @@ export class McpServer {
                     items++;
                   }
                 } finally {
-                  await target.cdp.send("DOMStorage.disable").catch(() => undefined);
+                  await runUnguarded(() => target.cdp.send("DOMStorage.disable")).catch(() => undefined);
                 }
               });
             } catch (error) {

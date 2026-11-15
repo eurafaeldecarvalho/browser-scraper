@@ -544,3 +544,12 @@ test("a dialog on a page attached for export_session is handled by the dialog po
   await tool.run({ path: join(dir, "s.json") });
   assert.equal(wired, 1);
 });
+
+test("cleanup sends that undo page state run unguarded (survive a stale call)", () => {
+  const src = readFileSync(join(__dirname, "../../src/mcp/server.ts"), "utf8");
+  const cleanups = src.split("\n").filter((l) => /DOMStorage\.disable|setInterceptFileChooserDialog", \{ enabled: false/.test(l));
+  assert.ok(cleanups.length >= 3);
+  for (const line of cleanups) {
+    assert.match(line, /runUnguarded\(/, line.trim());
+  }
+});
