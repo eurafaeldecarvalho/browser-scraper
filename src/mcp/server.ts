@@ -465,6 +465,8 @@ export class McpServer {
     while (this._launching) {
       await this._launching.catch(() => undefined);
     }
+    // The call may have been abandoned while it waited for another launch.
+    this._assert_current();
     const browser = this._ensure_browser();
     if (browser.launched && this._browser_setup) {
       return browser;
@@ -664,12 +666,21 @@ export class McpServer {
       this._assert_current();
       const browser = await this._launched_browser();
       const tab = await browser.newTab();
-      this._assert_current();
+      await this._discard_if_stale(browser, tab);
       this._tab = tab;
       this._tab_id_for(this._tab.target_id);
       this._wire(this._tab);
     }
     return this._tab;
+  }
+
+  // A page opened by a call that was abandoned meanwhile: close it (it would
+  // otherwise linger as an unnamed tab) and stop the call.
+  private async _discard_if_stale(browser: Browser, tab: Tab): Promise<void> {
+    if (this._stale()) {
+      await browser.closeTab(tab).catch(() => undefined);
+      this._assert_current();
+    }
   }
 
   private _tab_id_for(target_id: string): string {
@@ -792,6 +803,11 @@ export class McpServer {
   // Things that happened outside the last action: auto-answered dialogs,
   // relaunches, finished downloads, tabs the site opened.
   private async _collect_notes(): Promise<string> {
+    // An abandoned call must not drain notes/downloads/new-tab reports that
+    // belong in the next call's result.
+    if (this._stale()) {
+      return "";
+    }
     const notes = this._notes.splice(0);
     for (const download of this._downloads) {
       if (download.state === "completed" && !download.reported && !download.noted) {
@@ -1147,6 +1163,7 @@ export class McpServer {
   // an open tab of `origin`, or on a throwaway tab whose document for that
   // origin is served locally (Fetch interception: no request reaches the site).
   private async _with_origin_tab<T>(origin: string, fn: (tab: Tab) => Promise<T>): Promise<T> {
+    this._assert_current();
     const browser = await this._launched_browser();
     for (const page of await this._list_pages()) {
       let page_origin = "";
@@ -1160,6 +1177,7 @@ export class McpServer {
       }
     }
     const temp = await browser.newTab();
+    await this._discard_if_stale(browser, temp);
     this._seen_targets.add(temp.target_id);
     this._startup_targets.add(temp.target_id);
     const on_paused = (params: Record<string, any>): void => {
@@ -1179,6 +1197,7 @@ export class McpServer {
       temp.cdp.on("Fetch.requestPaused", on_paused as (params: unknown) => void);
       await temp.cdp.send("Fetch.enable", { patterns: [{ urlPattern: "*", requestStage: "Request" }] });
       await temp.goto({ url: `${origin}/`, waitUntil: "load", timeout: 15_000 });
+      this._assert_current();
       return await fn(temp);
     } finally {
       temp.cdp.off("Fetch.requestPaused", on_paused as (params: unknown) => void);
@@ -1303,9 +1322,9 @@ export class McpServer {
           }
           const browser = await this._launched_browser();
           const tab = await browser.newTab();
+          await this._discard_if_stale(browser, tab);
           this._tab_id_for(tab.target_id);
           this._wire(tab);
-          this._assert_current();
           this._tab = tab;
           if (this._options.browserOptions?.headless === false) {
             await tab.bringToFront().catch(() => undefined);
@@ -1377,6 +1396,8 @@ export class McpServer {
           const was_current = this._tab?.target_id === page.targetId;
           this._assert_current();
           await browser.closeTab(tab);
+          // Timed out while closing: the next call prunes the id itself.
+          this._assert_current();
           this._tab_ids.delete(page.id);
           this._forget_target(page.targetId);
           if (!was_current) {
@@ -1444,7 +1465,10 @@ export class McpServer {
           const tab = await this._ready_tab();
           const element = await tab.byRef({ ref: String(args.ref) });
           const value = this._fill_secrets(String(args.text));
-          await element.type({ text: value, clear: args.clear ?? true });
+          // A keystroke may open a dialog (manual mode): return at once.
+          if (await this._act(tab, () => element.type({ text: value, clear: args.clear ?? true }))) {
+            return text(await this._page_state(tab));
+          }
           if (args.submit) {
             if (await this._act(tab, () => element.pressKey({ key: "Enter" }))) {
               return text(await this._page_state(tab));
@@ -1592,9 +1616,12 @@ export class McpServer {
         inputSchema: { type: "object", properties: {} },
         run: async () => {
           const tab = await this._ready_tab();
-          const result = await tab.solveTurnstile();
+          let solved: unknown = false;
+          if (await this._act(tab, async () => { solved = (await tab.solveTurnstile()).solved; })) {
+            return text(await this._page_state(tab));
+          }
           await tab.sleep({ milliseconds: 1_500 });
-          return text(`solved: ${result.solved}\n\n${await this._page_state(tab)}`);
+          return text(`solved: ${String(solved)}\n\n${await this._page_state(tab)}`);
         },
       },
       {
@@ -1846,7 +1873,11 @@ export class McpServer {
         },
         run: async (args) => {
           const tab = await this._ready_tab();
-          const summary = await this._scroll(tab, args);
+          let summary = "";
+          // A scroll handler may open a dialog (manual mode): return at once.
+          if (await this._act(tab, async () => { summary = await this._scroll(tab, args); })) {
+            return text(await this._page_state(tab));
+          }
           return text(args.snapshot === false ? `${summary}\nURL: ${await tab.url()}` : `${summary}\n\n${await this._page_state(tab)}`);
         },
       },
@@ -1871,7 +1902,11 @@ export class McpServer {
         annotations: { readOnlyHint: true },
         run: async (args) => {
           const tab = await this._ready_tab();
-          const waited = await this._wait_for(tab, args);
+          let waited = 0;
+          // A dialog during the wait freezes every probe (manual mode).
+          if (await this._act(tab, async () => { waited = await this._wait_for(tab, args); })) {
+            return text(await this._page_state(tab));
+          }
           return text(`Condition met after ${waited} ms.\n\n${await this._page_state(tab)}`);
         },
       },
@@ -1934,7 +1969,8 @@ export class McpServer {
             throw new Error("No dialog is open on the current tab.");
           }
           const prompt_text = args.promptText !== undefined ? this._fill_secrets(String(args.promptText)) : undefined;
-          this._pending_dialogs.delete(tab.target_id);
+          // The entry stays until the answer lands: if this call times out,
+          // _abandon_current_tab re-binds it to the fresh connection.
           let gone = false;
           try {
             if (args.accept ?? true) {
@@ -1945,13 +1981,14 @@ export class McpServer {
           } catch (error) {
             // The page already closed it (navigation, timeout): nothing to answer.
             if (!/no dialog/i.test(String((error as Error)?.message ?? error))) {
-              // Still showing: keep it answerable instead of losing it.
-              if (!this._pending_dialogs.has(tab.target_id)) {
-                this._pending_dialogs.set(tab.target_id, pending);
-              }
+              // Still showing: it stays pending and answerable.
               throw error;
             }
             gone = true;
+          }
+          this._assert_current();
+          if (this._pending_dialogs.get(tab.target_id) === pending) {
+            this._pending_dialogs.delete(tab.target_id);
           }
           await tab.sleep({ milliseconds: 500 });
           await this._enforce_location(tab);
@@ -1976,6 +2013,8 @@ export class McpServer {
           while (Date.now() < deadline) {
             const entry = this._downloads.find((download) => !download.reported && download.state !== "inProgress");
             if (entry) {
+              // An abandoned wait must not consume the download.
+              this._assert_current();
               entry.reported = true;
               if (entry.state === "canceled") {
                 // File name and URL come from the site.
@@ -1984,6 +2023,7 @@ export class McpServer {
               const size = entry.path && existsSync(entry.path) ? statSync(entry.path).size : 0;
               return text(`Downloaded (${size} bytes):\n${this._untrusted(`Path: ${entry.path}\nFile: ${basename(entry.path ?? "")}\nFrom: ${entry.url}`)}`);
             }
+            this._assert_current();
             await delay(250);
           }
           const running = this._downloads.filter((download) => download.state === "inProgress");
@@ -2040,6 +2080,7 @@ export class McpServer {
               continue;
             }
             // Read through that page's own connection (see _with_origin_tab).
+            this._assert_current();
             const items = this._pending_dialogs.has(page.targetId) ? null : await this._read_local_storage(await this._ensure_browser().attachTab(page.targetId), origin);
             if (items && Object.keys(items).length > 0) {
               origins[origin] = { localStorage: items };
@@ -2048,6 +2089,8 @@ export class McpServer {
           // Write a sibling temp file and rename it over the target: a crash
           // mid-write never leaves a truncated session, and the 0600 mode
           // applies even when replacing an older export.
+          // Timed out meanwhile: the agent was told it failed — write nothing.
+          this._assert_current();
           const temp = `${path}.${process.pid}.tmp`;
           // Never follow or reuse a file planted under the temp name.
           rmSync(temp, { force: true });
@@ -2079,6 +2122,7 @@ export class McpServer {
             });
           const storage = Object.entries(data.origins).filter(([origin]) => in_scope(new URL(origin).hostname) || (skipped++, false));
           const tab = await this._get_tab();
+          this._assert_current();
           if (cookies.length > 0) {
             await tab.cdp.send("Network.setCookies", { cookies });
           }
@@ -2094,6 +2138,7 @@ export class McpServer {
                 await target.cdp.send("DOMStorage.enable");
                 try {
                   for (const [key, value] of pairs) {
+                    this._assert_current();
                     await target.cdp.send("DOMStorage.setDOMStorageItem", { storageId: { securityOrigin: origin, isLocalStorage: true }, key, value: String(value) });
                     items++;
                   }

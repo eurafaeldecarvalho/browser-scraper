@@ -373,3 +373,84 @@ test("a failed launch is retried on the next call", async () => {
   await server._launched_browser();
   assert.equal(launches, 2);
 });
+
+// Runs `body` inside a call that has timed out and been abandoned.
+async function in_abandoned_call(server: any, body: () => Promise<unknown>): Promise<unknown> {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let outcome: unknown;
+  let finished!: () => void;
+  const done = new Promise<void>((resolve) => (finished = resolve));
+  const stuck = { name: "click", run: async () => { await gate; try { outcome = await body(); } catch (error) { outcome = error; } finished(); return { content: [] }; } };
+  await assert.rejects(server._run_tool(stuck, {}), /did not finish within/);
+  release();
+  await done;
+  return outcome;
+}
+
+test("an abandoned call does not drain notes meant for the next call", async () => {
+  const server = new McpServer({ toolTimeoutMs: 50 }) as any;
+  server._note("Dialog on t1 auto-accepted");
+  assert.equal(await in_abandoned_call(server, () => server._collect_notes()), "");
+  assert.match(await server._collect_notes(), /auto-accepted/);
+});
+
+test("an abandoned wait_for_download does not consume the download", async () => {
+  const server = new McpServer({ toolTimeoutMs: 50 }) as any;
+  server._browser_cdp = {};
+  const tool = server._tools.find((entry: any) => entry.name === "wait_for_download");
+  const outcome = await in_abandoned_call(server, async () => {
+    server._record_download({ guid: "g1", url: "u", suggestedFilename: "cv.pdf" });
+    server._downloads[0].state = "completed";
+    return tool.run({ timeout: 5 });
+  });
+  assert.match(String((outcome as Error)?.message), /abandoned/);
+  assert.equal(server._downloads[0].reported, false);
+});
+
+test("an abandoned new_tab closes the page it opened and leaves state alone", async () => {
+  const server = new McpServer({ toolTimeoutMs: 50 }) as any;
+  const closed: string[] = [];
+  const opened = { target_id: "T9", cdp: { on: () => undefined }, onDialog: () => undefined };
+  const browser = { launched: true, alive: true, getTabs: async () => [], newTab: async () => opened, closeTab: async (tab: any) => { closed.push(tab.target_id); }, forgetTab: async () => undefined, attachTab: async () => opened };
+  server._browser = browser;
+  server._browser_setup = true;
+  const tool = server._tools.find((entry: any) => entry.name === "new_tab");
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  browser.newTab = async () => { await gate; return opened; };
+  const run = server._run_tool(tool, {});
+  await assert.rejects(run, /did not finish within/);
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(closed, ["T9"]);
+  assert.equal(server._tab, null);
+  assert.equal(server._tab_ids.size, 0);
+});
+
+test("handle_dialog that times out leaves the dialog pending for the fresh connection", async () => {
+  const server = new McpServer({ toolTimeoutMs: 80 }) as any;
+  const fresh_tab = { target_id: "T1", cdp: { on: () => undefined }, onDialog: () => undefined };
+  server._browser = { launched: true, alive: true, forgetTab: async () => undefined, attachTab: async () => fresh_tab, getTabs: async () => [] };
+  server._tab = { target_id: "T1" };
+  const dialog = { accept: () => new Promise(() => undefined), dismiss: async () => undefined };
+  server._pending_dialogs.set("T1", { type: "confirm", message: "sure?", defaultPrompt: "", dialog });
+  const tool = server._tools.find((entry: any) => entry.name === "handle_dialog");
+  await assert.rejects(server._run_tool(tool, { accept: true }), /did not finish within/);
+  const pending = server._pending_dialogs.get("T1");
+  assert.equal(pending?.message, "sure?");
+  assert.notEqual(pending.dialog, dialog);
+});
+
+test("type returns at once when a keystroke opens a dialog in manual mode", async () => {
+  const server = new McpServer({ dialogPolicy: "manual" }) as any;
+  const tab: any = { target_id: "T1", byRef: async () => ({ type: () => new Promise(() => undefined) }), url: async () => "", title: async () => "" };
+  server._tab = tab;
+  server._browser = { getTabs: async () => [{ type: "page", id: "T1", url: "https://x.test/", title: "x" }] };
+  const tool = server._tools.find((entry: any) => entry.name === "type");
+  const run = tool.run({ ref: "e1", text: "a" });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  server._pending_dialogs.set("T1", { type: "alert", message: "hi", defaultPrompt: "", dialog: {} });
+  for (const waiter of server._dialog_waiters) waiter("T1");
+  assert.match((await run).content[0].text, /alert dialog is open/);
+});
