@@ -1,5 +1,6 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { gzipSync } from "node:zlib";
 
 // Two origins on one server: 127.0.0.1 and localhost are different SITES, so an
 // iframe from one inside the other is rendered out-of-process (OOPIF) by
@@ -171,6 +172,12 @@ export async function startFixtureServer(): Promise<FixtureServer> {
     if (path === "/evil-download") {
       res.writeHead(200, { "content-type": "text/plain", "content-disposition": 'attachment; filename="../../evil.txt"' });
       res.end("evil\n");
+      return;
+    }
+    if (path === "/api/bomb") {
+      // ~12 MB of JSON that is only a few KB gzipped on the wire.
+      res.writeHead(200, { "content-type": "application/json", "content-encoding": "gzip" });
+      res.end(gzipSync(Buffer.from(`{"pad":"${"a".repeat(12 * 1024 * 1024)}"}`)));
       return;
     }
     if (path === "/api/data") {

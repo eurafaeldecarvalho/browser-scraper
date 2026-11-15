@@ -926,6 +926,11 @@ export class Browser {
     }
   }
 
+  // Tabs this browser has a CDP connection to (snapshot of the list).
+  get openTabs(): Tab[] {
+    return [...this._tabs];
+  }
+
   // Drops a Tab whose page target is already gone (closed by the page or the
   // user): closes its CDP connection without asking Chrome to close anything.
   async forgetTab(targetId: string): Promise<void> {

@@ -59,7 +59,7 @@ type ToolResult = { content: ToolContent[]; isError?: boolean };
 // A context is stale once its call timed out (generation moved on) or the work
 // was abandoned (a manual dialog returned control first); every CDP command
 // and every state change from a stale context is refused.
-type CallContext = { generation: number; abandoned: boolean; parent: CallContext | null; quiet?: boolean };
+type CallContext = { generation: number; abandoned: boolean; parent: CallContext | null; quiet?: boolean; progress?: string[] };
 
 // Tools raced against a manual dialog opening on the current tab: none of these
 // touch the current page's renderer, so a dialog cannot freeze them.
@@ -79,6 +79,9 @@ type NetEntry = {
   state: "pending" | "finished" | "failed";
   error: string;
   size: number;
+  // Decoded body bytes (Network.dataReceived): size is the wire size, and a
+  // gzip/brotli bomb is tiny on the wire.
+  decoded: number;
   seq: number;
   waited: boolean;
   cdp: CDPClient;
@@ -432,7 +435,9 @@ export class McpServer {
     if (!tab) {
       throw new Error(`A dialog opened during ${tool.name}; call handle_dialog.`);
     }
-    return { content: [{ type: "text", text: `${tool.name} stopped: a dialog opened.\n${await this._page_state(tab)}` }] };
+    // batch: say which steps already ran, so the agent does not repeat them.
+    const progress = work.context.progress?.length ? `Steps done before the dialog:\n${work.context.progress.join("\n")}\n` : "";
+    return { content: [{ type: "text", text: `${tool.name} stopped: a dialog opened.\n${progress}${await this._page_state(tab)}` }] };
   }
 
   private _assert_current(): void {
@@ -1020,6 +1025,7 @@ export class McpServer {
         state: "pending",
         error: "",
         size: 0,
+        decoded: 0,
         seq: this._call_seq,
         waited: false,
         cdp,
@@ -1034,6 +1040,13 @@ export class McpServer {
         entry.status = Number(params.response?.status ?? 0);
         entry.mimeType = String(params.response?.mimeType ?? "");
         entry.seq = this._call_seq;
+      }
+    });
+    cdp.on("Network.dataReceived", (raw) => {
+      const params = raw as Record<string, any>;
+      const entry = find(params);
+      if (entry) {
+        entry.decoded += Number(params.dataLength ?? 0) || 0;
       }
     });
     cdp.on("Network.loadingFinished", (raw) => {
@@ -1056,6 +1069,14 @@ export class McpServer {
         by_request.delete(entry.requestId);
       }
     });
+  }
+
+  // Every attached tab without an open dialog (a frozen page would hang the
+  // call), current tab first: emulation is session-wide, so a tab left on the
+  // old timezone/locale would contradict the others.
+  private _emulation_tabs(current: Tab): Tab[] {
+    const others = (this._browser?.openTabs ?? []).filter((each) => each !== current && this._wired.has(each.target_id) && !this._pending_dialogs.has(each.target_id));
+    return [current, ...others];
   }
 
   private async _apply_emulation(tab: Tab): Promise<void> {
@@ -1081,8 +1102,9 @@ export class McpServer {
     if (entry.state !== "finished") {
       throw new Error(`${entry.id} has no body (${entry.state === "failed" ? `failed: ${entry.error}` : "still loading"}).`);
     }
-    if (entry.size > MAX_BODY_BYTES) {
-      throw new Error(`${entry.id} body is ${format_bytes(entry.size)}; response_body reads at most ${format_bytes(MAX_BODY_BYTES)}.`);
+    const bytes_in = Math.max(entry.size, entry.decoded);
+    if (bytes_in > MAX_BODY_BYTES) {
+      throw new Error(`${entry.id} body is ${format_bytes(bytes_in)}; response_body reads at most ${format_bytes(MAX_BODY_BYTES)}.`);
     }
     let result: Record<string, any>;
     try {
@@ -3113,12 +3135,13 @@ export class McpServer {
             accuracy: { type: "number", default: 50 },
             timezone: { type: "string" },
             locale: { type: "string" },
-            reset: { type: "boolean", default: false, description: "Clear every override set here (current tab; new tabs get none)." },
+            reset: { type: "boolean", default: false, description: "Clear every override set here, on every open tab." },
           },
         },
         run: async (args) => {
           const tab = await this._get_tab();
           if (args.reset) {
+            this._assert_current();
             const had_geolocation = this._emulation.latitude !== undefined;
             this._emulation = {};
             if (had_geolocation && this._browser_cdp) {
@@ -3128,7 +3151,9 @@ export class McpServer {
             }
             // Back to the launch baseline (--geo / stealth locale, timezone and
             // Accept-Language), so navigator.languages matches the locale again.
-            await tab.resetEmulation().catch(() => undefined);
+            for (const each of this._emulation_tabs(tab)) {
+              await each.resetEmulation().catch(() => undefined);
+            }
             return text("Emulation overrides cleared.");
           }
           if ((args.latitude === undefined) !== (args.longitude === undefined)) {
@@ -3165,6 +3190,11 @@ export class McpServer {
             await this._browser_cdp.send("Browser.grantPermissions", { permissions: ["geolocation"] }).catch(() => undefined);
           }
           await this._apply_emulation(tab);
+          for (const each of this._emulation_tabs(tab)) {
+            if (each !== tab) {
+              await this._apply_emulation(each).catch(() => undefined);
+            }
+          }
           return text(`Emulation now: ${JSON.stringify(next)} (applies to this tab and every tab opened later; reload pages that already read the old values).`);
         },
       },
@@ -3283,6 +3313,10 @@ export class McpServer {
             }
           }
           const lines: string[] = [];
+          const own = this._call_context.getStore();
+          if (own) {
+            own.progress = lines;
+          }
           const extra: ToolContent[] = [];
           let last: ToolResult | null = null;
           for (const [index, step] of steps.entries()) {

@@ -198,6 +198,12 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
     assert.match(out.text, /"method": "POST"/);
     out = await tool("response_body", { id: "r999999" });
     assert.equal(out.isError, true);
+    // Size cap uses the decoded size: a gzip bomb is tiny on the wire.
+    await tool("evaluate", { expression: "fetch('/api/bomb').then((r) => r.text()).then((t) => t.length)", world: "main" });
+    out = await tool("network_requests", { urlIncludes: "/api/bomb" });
+    out = await tool("response_body", { id: ref(out.text, /(r\d+) t\d+ GET 200/) });
+    assert.equal(out.isError, true, out.text);
+    assert.match(out.text, /response_body reads at most/);
   });
 
   test("cookies, emulate, save_pdf, browser_status, batch", async () => {
@@ -228,6 +234,20 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
     assert.match((await languages())[1], /de-DE/);
     await tool("emulate", { reset: true });
     assert.doesNotMatch((await languages())[1], /de-DE/);
+    // Emulation is session-wide: tabs opened before the call follow it, and reset.
+    const zone = "Intl.DateTimeFormat().resolvedOptions().timeZone";
+    const first_tab = ref((await tool("snapshot")).text, /Tab: (t\d+)/);
+    const second_tab = ref((await tool("new_tab", { url: `${server.origin}/tools` })).text, /Tab: (t\d+)/);
+    await tool("switch_tab", { id: first_tab });
+    await tool("emulate", { timezone: "Asia/Tokyo" });
+    await tool("switch_tab", { id: second_tab });
+    assert.match((await tool("evaluate", { expression: zone, world: "main" })).text, /Asia\/Tokyo/);
+    await tool("emulate", { reset: true });
+    await tool("switch_tab", { id: first_tab });
+    assert.doesNotMatch((await tool("evaluate", { expression: zone, world: "main" })).text, /Asia\/Tokyo/);
+    await tool("switch_tab", { id: second_tab });
+    await tool("close_tab", {});
+    await tool("switch_tab", { id: first_tab });
 
     out = await tool("save_pdf", { path: "\\\\127.0.0.1\\share\\x.pdf" });
     assert.equal(out.isError, true);

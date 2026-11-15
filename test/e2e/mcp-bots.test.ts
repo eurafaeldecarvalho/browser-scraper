@@ -166,6 +166,12 @@ describe("mcp bot tools over stdio (e2e)", { skip: chrome ? false : "Chrome not 
     out = await tool("handle_dialog", { accept: false });
     assert.match(out.text, /Dismissed confirm/);
     assert.match(out.text, /confirm:false/);
+    // batch stopped by a dialog reports the steps that already ran.
+    page = (await tool("snapshot")).text;
+    out = await tool("batch", { steps: [{ tool: "find", args: { text: "Ask confirm" } }, { tool: "click", args: { ref: ref(page, /button "Ask confirm" \[ref=(e\d+)\]/) } }, { tool: "snapshot" }] });
+    assert.match(out.text, /batch stopped: a dialog opened\.\nSteps done before the dialog:\n1\. find: ok/);
+    out = await tool("handle_dialog", { accept: false });
+    assert.match(out.text, /Dismissed confirm/);
 
     // downloads
     out = await tool("click", { ref: ref(out.text, /link "Download report" \[ref=(e\d+)\]/) });
