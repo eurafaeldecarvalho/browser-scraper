@@ -4,6 +4,7 @@ import { basename, dirname, extname, isAbsolute, join, resolve as resolve_path }
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
+import { runInNewContext } from "node:vm";
 
 import { Browser, type BrowserOptions } from "../core/browser";
 import { addSendGuard, CDPClient, runUnguarded } from "../core/cdp-client";
@@ -107,6 +108,10 @@ const LONG_TOOL_TIMEOUT_MS: Record<string, number> = { wait_for_download: 630_00
 // Network requests remembered across all tabs (oldest dropped first).
 const MAX_NETWORK_ENTRIES = 1_000;
 
+// Images (screenshots) returned from batch steps before the last one: a
+// 50-step batch of screenshots would be one response of tens of MB.
+const MAX_BATCH_IMAGES = 3;
+
 // drop_files refuses more than this in total (files travel over CDP as base64
 // only on the paste path; drops pass file paths).
 const MAX_DROP_BYTES = 50 * 1024 * 1024;
@@ -188,8 +193,9 @@ export class McpServer {
   private _generation = 0;
   private _call_context = new AsyncLocalStorage<CallContext>();
   private _out: NodeJS.WritableStream;
-  // Last snapshot text per tab (target id), the base of diff snapshots.
-  private _last_snapshots = new Map<string, string>();
+  // Last snapshot text per tab (target id) and the document it belongs to, the
+  // base of diff snapshots.
+  private _last_snapshots = new Map<string, { doc: number; text: string }>();
   private _requests: NetEntry[] = [];
   private _next_request_id = 1;
   // Bumped per tool call: wait_for_response matches responses that arrived
@@ -983,10 +989,13 @@ export class McpServer {
       return "(snapshot omitted — call snapshot, or find to look up elements by text/role)";
     }
     const snap = await tab.snapshot({ interactive: Boolean(options.interactive) });
-    // Diffs only compare like with like: an interactive-only list is not a base.
-    const previous = options.interactive ? undefined : this._last_snapshots.get(tab.target_id);
+    // Diffs only compare like with like: an interactive-only list is not a base,
+    // and neither is a snapshot of a document that was navigated away from (its
+    // refs are gone, and identical lines would read as "no changes").
+    const base = this._last_snapshots.get(tab.target_id);
+    const previous = options.interactive || base?.doc !== tab.documentGeneration ? undefined : base.text;
     if (!options.interactive) {
-      this._last_snapshots.set(tab.target_id, snap);
+      this._last_snapshots.set(tab.target_id, { doc: tab.documentGeneration, text: snap });
     }
     return this._untrusted(mode === "diff" ? snapshot_diff(previous, snap) : snap);
   }
@@ -3322,6 +3331,7 @@ export class McpServer {
             own.progress = lines;
           }
           const extra: ToolContent[] = [];
+          let dropped_images = false;
           let last: ToolResult | null = null;
           for (const [index, step] of steps.entries()) {
             this._assert_current();
@@ -3335,8 +3345,10 @@ export class McpServer {
             } catch (error) {
               const message = String((error as Error)?.message ?? error);
               if (RELAUNCH_ERROR.test(message)) {
-                // Let the relaunch logic see a dead browser.
-                throw error;
+                // Let the relaunch logic see a dead browser — but say which
+                // steps already ran: repeating the whole batch would submit
+                // them twice.
+                throw new Error(`${message} (batch stopped at step ${index + 1}${lines.length ? `; steps done: ${lines.join("; ")}` : ""})`);
               }
               lines.push(`${index + 1}. ${tool.name}: ERROR ${message}`);
               if (args.stopOnError ?? true) {
@@ -3351,15 +3363,24 @@ export class McpServer {
               lines.push(`${index + 1}. ${tool.name}: ok`);
             } else {
               const first = result.content.find((part) => part.type === "text") as { text: string } | undefined;
-              const summary = (first?.text ?? "").split("\n").filter((line) => line && !/^(Tab|Page|URL): /.test(line) && !line.includes("untrusted-page-content"))[0] ?? "";
+              const summary = batch_step_summary(first?.text ?? "");
               lines.push(`${index + 1}. ${tool.name}: ${result.isError ? "ERROR " : "ok"}${summary ? ` — ${summary.slice(0, 200)}` : ""}`);
               extra.push(...result.content.filter((part) => part.type === "image"));
+              // Bound what earlier steps hand back: 50 screenshots would be a
+              // single response of tens of MB.
+              if (extra.length > MAX_BATCH_IMAGES) {
+                extra.splice(0, extra.length - MAX_BATCH_IMAGES);
+                dropped_images = true;
+              }
               if (result.isError && (args.stopOnError ?? true)) {
                 lines.push(`Stopped at step ${index + 1}; later steps were not run.`);
                 const tab = this._tab;
                 return { content: [{ type: "text", text: `${lines.join("\n")}${tab ? `\n\n${await this._page_state(tab).catch(() => "")}` : ""}` }, ...extra], isError: true };
               }
             }
+          }
+          if (dropped_images) {
+            lines.push(`(earlier steps' images dropped — at most ${MAX_BATCH_IMAGES} are returned)`);
           }
           const tail = last?.content ?? [];
           const tail_text = tail.filter((part) => part.type === "text").map((part) => (part as { text: string }).text).join("\n");
@@ -3485,32 +3506,68 @@ export function snapshot_diff(previous: string | undefined, next: string): strin
   return body;
 }
 
+// Lines matching a regex, evaluated with a hard time limit (see find_in_snapshot).
+// Returns the indexes of the matching lines.
+function regex_matches(pattern: RegExp, stripped: string[]): Set<number> {
+  let flags: boolean[];
+  try {
+    flags = runInNewContext("lines.map((line) => pattern.test(line))", { lines: stripped, pattern }, { timeout: REGEX_TIMEOUT_MS }) as boolean[];
+  } catch (error) {
+    if (/timed out/i.test(String((error as Error)?.message ?? error))) {
+      throw new Error(`Regex ${String(pattern)} took over ${REGEX_TIMEOUT_MS} ms on this page (catastrophic backtracking); use a simpler pattern or plain text.`);
+    }
+    throw error;
+  }
+  return new Set(flags.flatMap((hit, index) => (hit ? [index] : [])));
+}
+
+const REGEX_TIMEOUT_MS = 2_000;
+
+// One-line status of a non-final batch step: only text the tool itself wrote,
+// never a line from inside <untrusted-page-content> (that would put page text
+// outside the markers).
+export function batch_step_summary(result_text: string): string {
+  const marker = result_text.search(/<untrusted-page-content>/);
+  const own = marker >= 0 ? result_text.slice(0, marker) : result_text;
+  return own.split("\n").filter((line) => line.trim() && !/^(Tab|Page|URL): /.test(line))[0] ?? "";
+}
+
 // Lines of a snapshot matching a text and/or role, with context lines and the
 // nearest enclosing container lines (dialog, form, section…), "…" between gaps.
 export function find_in_snapshot(snapshot: string, { text, role, context = 1, limit = 20 }: { text?: string; role?: string; context?: number; limit?: number }): { text: string; matches: number; shown: number } {
   const lines = snapshot.split("\n");
-  let test_text: ((line: string) => boolean) | null = null;
+  let test_text: ((line: string, index: number) => boolean) | null = null;
+  let regex_pattern: RegExp | null = null;
   if (text !== undefined && text !== "") {
     const regex = /^\/(.+)\/([a-z]*)$/.exec(text);
     if (regex) {
       let pattern: RegExp;
       try {
-        pattern = new RegExp(regex[1], regex[2].includes("i") ? regex[2] : `${regex[2]}i`);
+        // g/y make test() stateful (lastIndex): every other matching line would be skipped.
+        const flags = regex[2].replace(/[gy]/g, "");
+        pattern = new RegExp(regex[1], flags.includes("i") ? flags : `${flags}i`);
       } catch (error) {
         throw new Error(`Invalid regex ${text}: ${String((error as Error).message)}`);
       }
-      test_text = (line) => pattern.test(line.replace(/\s*\[ref=e\d+\]/, ""));
+      regex_pattern = pattern;
     } else {
       const needle = text.replace(/\s+/g, " ").trim().toLowerCase();
       test_text = (line) => line.replace(/\s*\[ref=e\d+\]/, "").replace(/\s+/g, " ").toLowerCase().includes(needle);
     }
+  }
+  if (regex_pattern) {
+    // The regex comes from the agent (possibly talked into it by the page) and
+    // runs on page text: a catastrophic-backtracking pattern would block the
+    // event loop, and then no tool timeout can fire. Run it under a vm timeout.
+    const matched = regex_matches(regex_pattern, lines.map((line) => line.replace(/\s*\[ref=e\d+\]/, "")));
+    test_text = (_line, index) => matched.has(index);
   }
   const wanted_role = role?.trim().toLowerCase();
   const role_of = (line: string): string => (/^\s*-\s+([A-Za-z]+)/.exec(line)?.[1] ?? "").toLowerCase();
   const indent = (line: string): number => /^\s*/.exec(line)?.[0].length ?? 0;
   const hits: number[] = [];
   lines.forEach((line, index) => {
-    if ((wanted_role === undefined || wanted_role === "" || role_of(line) === wanted_role) && (!test_text || test_text(line))) {
+    if ((wanted_role === undefined || wanted_role === "" || role_of(line) === wanted_role) && (!test_text || test_text(line, index))) {
       hits.push(index);
     }
   });

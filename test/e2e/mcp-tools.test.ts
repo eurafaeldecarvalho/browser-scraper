@@ -88,6 +88,7 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
     assert.match(page, /button "Needle button"/);
     const full_size = page.length;
 
+    let out: Result;
     const found = await tool("find", { text: "needle" });
     assert.equal(found.isError, false, found.text);
     assert.match(found.text, /1 match\(es\)/);
@@ -117,6 +118,13 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
     assert.match((await tool("snapshot", { diff: true })).text, /\+ .*Injected heading/);
     const full = await tool("snapshot");
     assert.match(full.text, /button "Needle button" \[ref=e\d+\]/);
+
+    // A navigation starts a new document: the diff base must be dropped, or an
+    // identical page reads as "no changes" while every old ref is gone.
+    await tool("navigate", { url: `${server.origin}/products` });
+    out = await tool("navigate", { url: `${server.origin}/products` });
+    assert.match(out.text, /heading "Products"/);
+    assert.doesNotMatch(out.text, /no changes since the last snapshot/);
   });
 
   test("right click, click_at, drag (pointer slider and HTML5 dnd), contenteditable typing", async () => {
@@ -303,6 +311,31 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
     assert.match(out.text, /Stopped at step 1/);
     out = await tool("batch", { steps: [{ tool: "batch", args: {} }] });
     assert.match(out.text, /cannot be nested/);
+
+    // Screenshots from earlier steps are bounded: 5 of them would be one
+    // response of several MB.
+    out = await tool("batch", {
+      steps: [
+        { tool: "screenshot" },
+        { tool: "screenshot" },
+        { tool: "screenshot" },
+        { tool: "screenshot" },
+        { tool: "screenshot" },
+        { tool: "snapshot" },
+      ],
+    });
+    assert.equal(out.raw.content.filter((part: any) => part.type === "image").length, 3, out.text);
+    assert.match(out.text, /earlier steps' images dropped/);
+
+    // A batch whose browser dies mid-way must say which steps already ran:
+    // repeating them would submit them twice.
+    out = await tool("batch", {
+      steps: [{ tool: "navigate", args: { url: `${server.origin}/tools` } }, { tool: "close_browser" }, { tool: "snapshot" }],
+    });
+    assert.equal(out.isError, true, out.text);
+    assert.match(out.text, /step 3/);
+    assert.match(out.text, /1\. navigate: ok/);
+    assert.match(out.text, /2\. close_browser: ok/);
   });
 
   test("solve_captcha: checkbox click, and image challenge returned for vision", async () => {

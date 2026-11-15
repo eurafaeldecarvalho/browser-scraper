@@ -78,6 +78,9 @@ export class Tab {
   // for another element.
   private _stable_refs = new Map<string, string>();
   private _ref_counter = 0;
+  // Bumped on every main-frame navigation: a diff snapshot must not compare a
+  // new document against the previous one (identical lines, gone refs).
+  private _document_generation = 0;
   // In-flight network requests of this page, for waitForNetworkIdle().
   // requestId -> start time. Requests older than INFLIGHT_STALE_MS stop
   // counting (long-polls, websockets, requests that never get a response).
@@ -598,6 +601,12 @@ export class Tab {
     this._invalidate_execution_context();
     // A new document: its nodes are new elements.
     this._stable_refs.clear();
+    this._document_generation += 1;
+  }
+
+  // Increases with every main-frame navigation of this tab.
+  get documentGeneration(): number {
+    return this._document_generation;
   }
 
   private _on_frame_detached(params: Record<string, any>): void {
