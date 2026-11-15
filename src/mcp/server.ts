@@ -1209,7 +1209,8 @@ export class McpServer {
     for (const download of this._downloads) {
       if (download.state === "completed" && !download.reported && !download.noted) {
         download.noted = true;
-        notes.push(`Download finished: ${download.path} (call wait_for_download to collect it).`);
+        // The file name comes from the site.
+        notes.push(`Download finished (call wait_for_download to collect it): ${this._untrusted(String(download.path))}`);
       }
     }
     const fresh = (await this._list_pages().catch(() => [])).filter((page) => !this._seen_targets.has(page.targetId));
@@ -2929,7 +2930,8 @@ export class McpServer {
               };
               if ('value' in this && typeof this.value === 'string') out.value = clip(this.value, 20000);
               if ('checked' in this && (this.type === 'checkbox' || this.type === 'radio')) out.checked = this.checked;
-              if (this.href) out.href = String(this.href);
+              const href = typeof this.href === 'string' ? this.href : this.href && this.href.baseVal; // SVG <a>: SVGAnimatedString
+              if (href) out.href = String(href);
               if (this.isContentEditable) out.contentEditable = true;
               return out;
             }`,
@@ -3153,7 +3155,8 @@ export class McpServer {
           }
           this._assert_current();
           writeFileSync(path, data, { flag: "wx" });
-          return text(`Saved PDF (${format_bytes(data.length)}): ${path}`);
+          // The default name comes from the page title: keep it inside the markers.
+          return text(`Saved PDF (${format_bytes(data.length)}):\n${this._untrusted(`Path: ${path}`)}`);
         },
       },
       {

@@ -132,7 +132,7 @@ more();feed.addEventListener('scroll',()=>{if(feed.scrollTop+feed.clientHeight>=
 <p id="pz"></p>
 <button onclick="fetch('/api/data?q=1',{method:'POST',body:'x'}).then(r=>r.json()).then(j=>document.getElementById('api').textContent='api:'+j.items.length)">Load data</button>
 <p id="api"></p>
-<a id="far" href="/products" data-id="42">Products link</a>
+<a id="far" href="/products" data-id="42">Products link</a><svg width="40" height="20"><a id="svglink" href="/svg-target"><text x="2" y="15">svg</text></a></svg>
 <ul>${Array.from({ length: 200 }, (_, i) => `<li>Row ${i} <button>Edit ${i}</button></li>`).join("")}</ul>
 <button>Needle button</button>
 <script>

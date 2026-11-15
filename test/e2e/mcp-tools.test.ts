@@ -166,6 +166,8 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
     assert.equal(json((await tool("evaluate", { expression: "document.getElementById('composer').innerText.trim()" })).text), "Hello from the bot #launch");
 
     const info = json((await tool("element_info", { ref: ref(page, /link "Products link" \[ref=(e\d+)\]/) })).text);
+    // SVG <a>: href is an SVGAnimatedString, not "[object SVGAnimatedString]".
+    assert.match(json((await tool("element_info", { selector: "#svglink" })).text).href, /\/svg-target$/);
     assert.equal(info.tag, "a");
     assert.equal(info.attributes["data-id"], "42");
     assert.match(info.href, /\/products$/);
@@ -274,7 +276,9 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
 
     out = await tool("save_pdf", {});
     assert.equal(out.isError, false, out.text);
-    const pdf = /: (.+\.pdf)$/.exec(out.text)?.[1] ?? "";
+    const pdf = /Path: (.+\.pdf)/.exec(out.text)?.[1] ?? "";
+    // The title-derived name is page-controlled: it stays inside the markers.
+    assert.match(out.text, /<untrusted-page-content>[^]*Path: [^]*\.pdf/);
     assert.ok(existsSync(pdf), out.text);
     assert.equal(readFileSync(pdf).subarray(0, 4).toString(), "%PDF");
 
