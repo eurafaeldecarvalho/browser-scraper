@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { secret_forms } from "../../src/mcp/server";
+import { base64_cores, secret_forms } from "../../src/mcp/server";
 
 test("secret_forms covers URL, form, JSON and HTML encodings", () => {
   const secret = 'p@ss w0rd/"x&y';
@@ -36,5 +36,22 @@ test("secret_forms covers nested URL encoding, numeric entities and Go-style JSO
 });
 
 test("secret_forms of a plain value is just the value", () => {
-  assert.deepEqual(secret_forms("hunter2secret"), ["hunter2secret"]);
+  assert.deepEqual(secret_forms("hunter2secret").filter((f) => !base64_cores("hunter2secret").includes(f)), ["hunter2secret"]);
+});
+
+test("secret_forms covers base64 at any offset, strict percent-encoding and ASCII-only JSON", () => {
+  const secret = "S3cr3t!pässw(rd)";
+  const forms = secret_forms(secret);
+  const redact = (text: string) => forms.reduce((out, f) => out.split(f).join("{{X}}"), text);
+  for (const prefix of ["", "u:", "ab:", "user:"]) {
+    const b64 = Buffer.from(prefix + secret).toString("base64");
+    const out = redact(`Authorization: Basic ${b64}`);
+    assert.ok(out.includes("{{X}}"), `base64 offset ${prefix.length} not redacted: ${out}`);
+    const url = redact(Buffer.from(prefix + secret).toString("base64url"));
+    assert.ok(url.includes("{{X}}"), `base64url offset ${prefix.length}`);
+  }
+  assert.ok(forms.includes("S3cr3t%21p%C3%A4ssw%28rd%29"));
+  assert.ok(forms.includes("S3cr3t!p\\u00e4ssw(rd)"));
+  assert.ok(forms.includes("S3cr3t!p\\u00E4ssw(rd)"));
+  assert.deepEqual(base64_cores("short"), []);
 });

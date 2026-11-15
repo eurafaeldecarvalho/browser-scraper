@@ -3886,11 +3886,49 @@ export function secret_forms(value: string): string[] {
   // innerHTML text nodes escape only & < > (quotes stay raw); evaluate then
   // JSON-escapes whatever HTML form it returned
   add(html);
+  try {
+    // RFC 3986 strict encoders (Java URLEncoder, Python quote(safe="")) also
+    // escape ! ' ( ) * and Python's quote_plus uses "+"
+    const strict = encodeURIComponent(value).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+    add(strict);
+    add(strict.replace(/%20/g, "+"));
+  } catch {
+    // lone surrogates
+  }
+  // ASCII-only JSON (Python json.dumps default, many APIs): non-ASCII as \uXXXX
+  const ascii_json = JSON.stringify(value)
+    .slice(1, -1)
+    .replace(/[\u007f-\uffff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  add(ascii_json);
+  add(ascii_json.replace(/\\u([0-9a-f]{4})/g, (_m, h: string) => `\\u${h.toUpperCase()}`));
   for (const form of [...forms]) {
     if (form === value) continue;
     add(JSON.stringify(form).slice(1, -1));
   }
+  // base64 / base64url (Basic auth headers, JWT-like tokens, cookies). The
+  // secret may sit at any byte offset inside the encoded blob ("user:pass"),
+  // so redact the run of characters that depends on the secret alone for each
+  // of the 3 alignments. Only for secrets long enough that the core is not a
+  // false-positive magnet.
+  for (const core of base64_cores(value)) {
+    forms.add(core);
+    forms.add(core.replace(/\+/g, "-").replace(/\//g, "_"));
+  }
   return [...forms].sort((a, b) => b.length - a.length);
+}
+
+export function base64_cores(value: string): string[] {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length < 6) return [];
+  const cores: string[] = [];
+  for (let k = 0; k < 3; k++) {
+    const b64 = Buffer.concat([Buffer.alloc(k), bytes]).toString("base64");
+    const start = Math.ceil((k * 8) / 6);
+    const end = Math.floor(((k + bytes.length) * 8) / 6);
+    const core = b64.slice(start, end);
+    if (core.length >= 6) cores.push(core);
+  }
+  return cores;
 }
 
 // Default save_pdf file stem from the page title. Redaction must run before
