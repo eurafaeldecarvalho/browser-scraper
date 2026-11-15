@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 
 import { generateExtractor, observe, type LlmRequest } from "../../src/ai/index";
-import { Browser, findChrome, scrape, ScrapeError, type Tab } from "../../src/index";
+import { Browser, findChrome, McpServer, scrape, ScrapeError, type Tab } from "../../src/index";
 import { startFixtureServer, type FixtureServer } from "../fixtures/server";
 
 // Real-Chrome tests. Skipped when no Chrome is installed (set CHROME_PATH to
@@ -206,5 +206,57 @@ describe("browser (e2e)", { skip: chrome ? false : "Chrome not found" }, () => {
       child.stdin.end();
       await new Promise((resolve) => child.on("exit", resolve));
     }
+  });
+});
+
+describe("mcp tabs (e2e)", { skip: chrome ? false : "Chrome not found" }, () => {
+  let server: FixtureServer;
+  let mcp: McpServer;
+  let id = 0;
+  const call = async (name: string, args: Record<string, unknown> = {}): Promise<string> => {
+    const response = await mcp.handle({ jsonrpc: "2.0", id: ++id, method: "tools/call", params: { name, arguments: args } });
+    const text = response.result.content[0].text as string;
+    assert.notEqual(response.result.isError, true, text);
+    return text;
+  };
+
+  before(async () => {
+    server = await startFixtureServer();
+    mcp = new McpServer({ browserOptions: { chromePath: chrome, headless: true, lambda: Boolean(process.env.CI) } });
+  });
+
+  after(async () => {
+    await mcp?.close();
+    await server?.close();
+  });
+
+  test("new_tab / list_tabs / switch_tab / close_tab, including a site-opened tab", async () => {
+    assert.match(await call("navigate", { url: `${server.origin}/popup` }), /^Tab: t1\nPage: Opener/);
+    assert.match(await call("new_tab", { url: `${server.origin}/products` }), /^Tab: t2\nPage: Products/);
+    const two = await call("list_tabs");
+    assert.match(two, /\* t2 {2}Products/);
+    assert.match(two, / {2}t1 {2}Opener/);
+
+    const back = await call("switch_tab", { id: "t1" });
+    assert.match(back, /^Tab: t1\nPage: Opener/);
+    assert.match(await call("snapshot"), /Opener/);
+
+    // The page opens a tab itself (target=_blank): it must show up and be usable.
+    const link = back.match(/link "Open products" \[ref=(e\d+)\]/);
+    assert.ok(link, back);
+    await call("click", { ref: link[1] });
+    let listed = "";
+    for (let attempt = 0; attempt < 20 && !/t3/.test(listed); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      listed = await call("list_tabs");
+    }
+    assert.match(listed, /t3 {2}Products/);
+    assert.match(await call("switch_tab", { id: "t3" }), /^Tab: t3\nPage: Products/);
+    assert.match(await call("markdown"), /# Products/);
+
+    assert.match(await call("close_tab", { id: "t2" }), /Current tab unchanged/);
+    assert.match(await call("close_tab"), /^Closed t3\.\n\nTab: t1/);
+    const one = await call("list_tabs");
+    assert.equal(one.match(/^[* ] t\d/gm)?.length, 1, one);
   });
 });

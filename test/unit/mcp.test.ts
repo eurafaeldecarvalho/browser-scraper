@@ -20,7 +20,7 @@ test("initialize negotiates the protocol and advertises tools", async () => {
 
   const list = await server.handle({ jsonrpc: "2.0", id: 3, method: "tools/list" });
   const names = list.result.tools.map((tool: any) => tool.name);
-  for (const name of ["navigate", "snapshot", "click", "type", "markdown", "scrape", "solve_turnstile"]) {
+  for (const name of ["navigate", "snapshot", "click", "type", "markdown", "scrape", "solve_turnstile", "new_tab", "list_tabs", "switch_tab", "close_tab"]) {
     assert.ok(names.includes(name), `missing tool ${name}`);
   }
   for (const tool of list.result.tools) {
@@ -46,6 +46,15 @@ test("guards: allowed domains, non-http schemes, no page yet", async () => {
 
   const early = await call("click", { ref: "e1" });
   assert.match(early.result.content[0].text, /call navigate first/);
+
+  const evil_tab = await call("new_tab", { url: "https://evil.test/" });
+  assert.match(evil_tab.result.content[0].text, /not in the allowed list/);
+
+  const none = await call("list_tabs", {});
+  assert.match(none.result.content[0].text, /No tabs open yet/);
+
+  const close = await call("close_tab", { id: "t1" });
+  assert.equal(close.result.isError, true);
 });
 
 test("secrets are parsed from .env and redacted from every output", async () => {

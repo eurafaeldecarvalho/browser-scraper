@@ -549,6 +549,10 @@ export class Browser {
     }
   }
 
+  get launched(): boolean {
+    return this._process !== null;
+  }
+
   async newTab({ url = "about:blank" }: { url?: string } = {}): Promise<Tab> {
     if (!this._process) {
       await this.launch();
@@ -585,6 +589,26 @@ export class Browser {
     if (this._debug_port && tab.target_id) {
       await fetch(`http://127.0.0.1:${this._debug_port}/json/close/${tab.target_id}`).catch(() => undefined);
     }
+  }
+
+  // Connects to a page target this library did not open itself — a popup
+  // ("Continue with Google"), a target=_blank link, window.open(). It gets the
+  // same stealth overrides as newTab(); they apply from the next document load
+  // on (the popup's first document has already started). Returns the existing
+  // Tab if that target is already attached.
+  async attachTab(targetId: string): Promise<Tab> {
+    const existing = this._tabs.find((tab) => tab.target_id === targetId);
+    if (existing) {
+      return existing;
+    }
+    const target_info = (await this.getTabs()).find((target) => target.id === targetId && target.type === "page");
+    if (!target_info?.webSocketDebuggerUrl) {
+      throw new BrowserError(`No page target with id ${targetId}`);
+    }
+    const tab = new Tab(target_info.webSocketDebuggerUrl, target_info, this._build_tab_stealth());
+    await tab.connect();
+    this._tabs.push(tab);
+    return tab;
   }
 
   async getTabs(): Promise<Record<string, any>[]> {

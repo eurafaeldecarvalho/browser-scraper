@@ -77,6 +77,7 @@ const PAGES: Record<string, (cross: string) => string> = {
     });
     parent.postMessage({ ua: navigator.userAgent }, "*");
   </script></body></html>`,
+  "/popup": () => `<!doctype html><html><head><title>Opener</title></head><body><h1>Opener</h1><a href="/products" target="_blank">Open products</a></body></html>`,
   "/blocked": () => `<!doctype html><html><head><title>Just a moment...</title></head><body><div id="challenge-running">Checking your browser</div><script>window._cf_chl_opt={}</script></body></html>`,
   "/spa": () => `<!doctype html><html><head><title>SPA</title></head><body><div id="root"></div><noscript>You need to enable JavaScript to run this app.</noscript><script>document.getElementById('root').innerHTML='<main><h1>Rendered by JS</h1><p>' + 'This content only exists after JavaScript runs. '.repeat(5) + '</p></main>'</script></body></html>`,
   "/products": () => `<!doctype html><html><head><title>Products</title></head><body><main><h1>Products</h1>
