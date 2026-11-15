@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { closeSync, existsSync, openSync, readlinkSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -8,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { defaultWebglForPlatform, geoForCountry, platformFromUA, type GeoProfile } from "../stealth/persona";
 import { ProfileManager } from "../stealth/profile";
 import { findChrome } from "../utils/chrome-finder";
+import { CDPClient } from "./cdp-client";
 import { HttpClient, type HttpClientOptions } from "./http";
 import { Tab, type TabStealth } from "./tab";
 
@@ -73,6 +75,37 @@ export async function removeProfileDir(
     } catch {
       if (i < attempts) await delay(retryDelayMs);
     }
+  }
+}
+
+// Returns a description of the process holding a Chrome profile, or null when
+// the profile is free. Windows: Chrome keeps <profile>/lockfile open with an
+// exclusive share mode. POSIX: <profile>/SingletonLock is a symlink to
+// "<host>-<pid>"; it is stale when that pid is gone.
+export function profileInUse(dir: string): string | null {
+  if (process.platform === "win32") {
+    const lock = join(dir, "lockfile");
+    if (!existsSync(lock)) {
+      return null;
+    }
+    try {
+      closeSync(openSync(lock, "r+"));
+      return null;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return code === "EBUSY" || code === "EPERM" || code === "EACCES" ? "lockfile is held" : null;
+    }
+  }
+  try {
+    const target = readlinkSync(join(dir, "SingletonLock"));
+    const pid = Number(target.slice(target.lastIndexOf("-") + 1));
+    if (!pid) {
+      return null;
+    }
+    process.kill(pid, 0);
+    return `pid ${pid}`;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM" ? "another user's process" : null;
   }
 }
 
@@ -410,6 +443,18 @@ export class Browser {
       );
     }
 
+    // A profile can only be open in one Chrome. Launching a second one on it
+    // hands the URL to the running instance and exits, which otherwise surfaces
+    // as an opaque "Timeout waiting for Chrome to start".
+    if (!this._temp_dir) {
+      const owner = profileInUse(this.userDataDir as string);
+      if (owner) {
+        throw new BrowserError(
+          `The profile ${this.userDataDir} is already in use by another Chrome (${owner}). Close that browser or use a different --user-data-dir.`,
+        );
+      }
+    }
+
     this._debug_port = await this._find_free_port();
 
     const win = this.windowSize ?? this.screen ?? { width: 1920, height: 1080 };
@@ -522,7 +567,28 @@ export class Browser {
         process.once("exit", () => resolve());
       });
 
-      if (globalThis.process.platform === "win32" && process.pid) {
+      // Ask Chrome to quit first: a graceful Browser.close flushes cookies and
+      // session state to a persistent profile; a hard kill can lose the last
+      // ~30 s of cookie writes (e.g. a login that just happened).
+      if (this._ws_endpoint && process.exitCode === null && process.signalCode === null) {
+        const cdp = new CDPClient(this._ws_endpoint);
+        try {
+          await cdp.connect();
+          void cdp.send("Browser.close").catch(() => undefined);
+          await Promise.race([exited, delay(5_000, undefined, { ref: false })]);
+        } catch {
+          // Fall through to the kill below.
+        } finally {
+          await cdp.disconnect().catch(() => undefined);
+        }
+      }
+
+      if (process.exitCode !== null || process.signalCode !== null) {
+        // Exited gracefully; still sweep helpers that may linger on Windows.
+        if (globalThis.process.platform === "win32" && process.pid) {
+          spawnSync("taskkill", ["/pid", String(process.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+        }
+      } else if (globalThis.process.platform === "win32" && process.pid) {
         // SIGTERM on Windows terminates only the browser process; its renderer /
         // GPU / crashpad children linger ~30s holding the inherited stderr pipe,
         // which keeps Node alive after close(). Kill the whole tree instead.
@@ -551,6 +617,17 @@ export class Browser {
 
   get launched(): boolean {
     return this._process !== null;
+  }
+
+  // Browser-level DevTools WebSocket (for Browser.* / Target.* commands).
+  get wsEndpoint(): string | null {
+    return this._ws_endpoint;
+  }
+
+  // False once Chrome has exited — crashed, killed, or the user closed its
+  // last window — after having been launched.
+  get alive(): boolean {
+    return this._process !== null && this._process.exitCode === null && this._process.signalCode === null;
   }
 
   async newTab({ url = "about:blank" }: { url?: string } = {}): Promise<Tab> {

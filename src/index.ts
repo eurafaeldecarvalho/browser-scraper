@@ -1,6 +1,7 @@
 export {
   Browser,
   BrowserError,
+  profileInUse,
   STEALTH_FLAGS,
   LAMBDA_FLAGS,
   SHELL_WEBGL_FLAGS,

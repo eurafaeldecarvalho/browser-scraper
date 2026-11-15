@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **MCP tabs:** `new_tab`, `list_tabs`, `switch_tab`, `close_tab`. Tabs share the profile, so a login form can wait in one tab while the agent reads the e-mailed code in another. Tabs opened by the site (popups, `target=_blank`) are listed, reported as a note in the next result, and switchable. Short tab ids (`t1`, `t2`…); refs are per tab and every switch returns a fresh snapshot.
+- **MCP tools for autonomous bots:** `hover`, `select_option` (native `<select>` and custom comboboxes), `set_checked`, `clear`, `fill_form`, `upload_file` (input or the button that opens the picker, via file-chooser interception), `scroll` (page or element, infinite feeds until N items / the end), `wait_for` (text, selector, ref, URL, network idle), `evaluate`, `paste` (real paste event), `handle_dialog`, `wait_for_download`, `tab_info`, `reload`, `go_forward`, `export_session` / `import_session` (cookies + localStorage to a file), `close_browser`. `press_key` takes shortcuts (`Control+A`) and an optional `ref`; `screenshot` takes `ref`/`selector` for one element; `snapshot` now starts with the tab id and title.
+- MCP: JS dialog policy (`--dialogs accept|dismiss|manual`, `dialogPolicy`), downloads folder (`--downloads-dir`, `downloadsDir`). Auto-answered dialogs and finished downloads are reported as notes.
+- MCP: if Chrome crashed or was closed by the user, the next call relaunches it on the same `--user-data-dir` and retries, instead of failing with `ECONNREFUSED`.
+- Library: `browser.attachTab(targetId)`, `browser.launched` / `browser.alive` / `browser.wsEndpoint`, `profileInUse(dir)`, `tab.waitForNetworkIdle()`, `tab.cdp`, `element.callFunction()`, `element.sessionId`; `element.selectOption()` also matches by `label` and returns the chosen option; `Keyboard.press()` / `pressKey()` accept modifier combos (`parseKeyCombo`).
+
+### Fixed
+- Launching on a `userDataDir` that another Chrome already uses now throws a clear `BrowserError` instead of timing out.
+- `browser.close()` asks Chrome to quit (`Browser.close`) before killing it, so cookies set just before closing persist in a reused profile (a hard kill on Windows lost them).
+- Clicking/hovering an element outside the viewport scrolls it into view first; before, the input landed off screen and did nothing.
+- `element.screenshot()` of an element inside an out-of-process iframe captured the wrong area.
+
 ## [0.8.3] — 2026-10-27
 
 ### Fixed

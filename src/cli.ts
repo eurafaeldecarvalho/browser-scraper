@@ -34,6 +34,8 @@ scrape / markdown:
 mcp:
   --allowed-domains <list>   Comma-separated; navigation elsewhere is refused
   --secrets <file>           .env file; the agent types values via {{NAME}} placeholders
+  --dialogs <policy>         accept | dismiss | manual — JS alert/confirm/prompt handling (default accept)
+  --downloads-dir <dir>      Where downloads are saved (default: <tmp>/browser-scraper-downloads)
 
 Examples:
   npx @eurafaeldecarvalho/browser-scraper markdown https://example.com
@@ -62,6 +64,8 @@ async function main(argv: string[]): Promise<number> {
       out: { type: "string" },
       "allowed-domains": { type: "string" },
       secrets: { type: "string" },
+      dialogs: { type: "string" },
+      "downloads-dir": { type: "string" },
       interactive: { type: "boolean" },
     },
   });
@@ -91,6 +95,8 @@ async function main(argv: string[]): Promise<number> {
       browserOptions,
       allowedDomains: values["allowed-domains"]?.split(",").map((d) => d.trim()).filter(Boolean),
       secrets: values.secrets ? parseEnvFile(values.secrets) : undefined,
+      dialogPolicy: parse_dialog_policy(values.dialogs),
+      downloadsDir: values["downloads-dir"],
       version: __version__,
     });
     process.stderr.write(`[browser-scraper] MCP server ${__version__} on stdio\n`);
@@ -190,3 +196,13 @@ main(process.argv.slice(2)).then(
     process.exitCode = 1;
   },
 );
+
+function parse_dialog_policy(value: string | undefined): "accept" | "dismiss" | "manual" | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === "accept" || value === "dismiss" || value === "manual") {
+    return value;
+  }
+  throw new Error(`--dialogs must be accept, dismiss or manual (got ${value}).`);
+}

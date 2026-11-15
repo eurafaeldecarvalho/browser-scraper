@@ -112,6 +112,51 @@ export function deriveKey(key: string): KeyDescriptor {
   return { key: char, code: "", keyCode: 0, text: char };
 }
 
+const MODIFIER_BITS: Record<string, number> = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
+const MODIFIER_ALIASES: Record<string, string> = {
+  alt: "Alt",
+  option: "Alt",
+  control: "Control",
+  ctrl: "Control",
+  meta: "Meta",
+  cmd: "Meta",
+  command: "Meta",
+  win: "Meta",
+  shift: "Shift",
+};
+
+// "Control+Shift+a" → { modifiers: ["Control", "Shift"], key: "a" }. A lone
+// "+" or a name without "+" is a plain key. "ControlOrMeta" picks Meta on macOS.
+export function parseKeyCombo(input: string): { modifiers: string[]; key: string } {
+  if (input.length <= 1 || !input.includes("+")) {
+    return { modifiers: [], key: input };
+  }
+  const parts = input.endsWith("++") ? [...input.slice(0, -2).split("+"), "+"] : input.split("+");
+  const key = parts.pop() ?? "";
+  const modifiers: string[] = [];
+  for (const part of parts) {
+    const lower = part.trim().toLowerCase();
+    const name = lower === "controlormeta" ? (process.platform === "darwin" ? "Meta" : "Control") : MODIFIER_ALIASES[lower];
+    if (!name) {
+      throw new Error(`Unknown modifier "${part}" in "${input}". Use Control, Shift, Alt or Meta.`);
+    }
+    if (!modifiers.includes(name)) {
+      modifiers.push(name);
+    }
+  }
+  return { modifiers, key: key.length === 1 ? key : (Object.keys(NAMED_KEYS).find((name) => name.toLowerCase() === key.toLowerCase()) ?? key) };
+}
+
+// On macOS, Chrome does not map Cmd shortcuts to editing commands for synthetic
+// key events; they have to be named explicitly.
+function mac_editing_commands(mask: number, key: string): string[] {
+  if (mask !== MODIFIER_BITS.Meta) {
+    return [];
+  }
+  const map: Record<string, string> = { a: "selectAll", c: "copy", x: "cut", v: "paste", z: "undo" };
+  return map[key.toLowerCase()] ? [map[key.toLowerCase()]] : [];
+}
+
 export class Keyboard {
   private _cdp: CDPClient;
   private _session_id: string | null;
@@ -142,7 +187,68 @@ export class Keyboard {
   // dispatching proper keyDown/keyUp pairs with realistic codes.
   async press(key: string): Promise<void> {
     await this._warm_input_pipeline();
+    const combo = parseKeyCombo(key);
+    if (combo.modifiers.length > 0) {
+      await this._press_combo(combo.modifiers, combo.key);
+      return;
+    }
     await this._press(key);
+  }
+
+  // A shortcut like "Control+A" or "Control+Shift+ArrowLeft": modifiers go down
+  // one by one (as fingers do), the key is pressed with the modifier mask set,
+  // then the modifiers come up in reverse order.
+  private async _press_combo(modifiers: string[], key: string): Promise<void> {
+    let mask = 0;
+    for (const modifier of modifiers) {
+      mask |= MODIFIER_BITS[modifier];
+      const descriptor = NAMED_KEYS[modifier];
+      await this._cdp.send(
+        "Input.dispatchKeyEvent",
+        { type: "rawKeyDown", key: descriptor.key, code: descriptor.code, windowsVirtualKeyCode: descriptor.keyCode, nativeVirtualKeyCode: descriptor.keyCode, modifiers: mask },
+        this._session_id,
+      );
+      await delay(random_between(30, 70));
+    }
+
+    // Letters follow the Shift state ("Control+A" is Ctrl + the a key, like a person presses it).
+    const letter = /^[a-z]$/i.test(key) ? (mask & MODIFIER_BITS.Shift ? key.toUpperCase() : key.toLowerCase()) : key;
+    const descriptor = deriveKey(letter);
+    // With Ctrl/Alt/Meta held the key produces no text (Ctrl+A selects, it
+    // doesn't type "a"); Shift alone still types the shifted character.
+    const produces_text = Boolean(descriptor.text) && (mask & ~MODIFIER_BITS.Shift) === 0;
+    const commands = process.platform === "darwin" ? mac_editing_commands(mask, descriptor.key) : [];
+    await this._cdp.send(
+      "Input.dispatchKeyEvent",
+      {
+        type: produces_text ? "keyDown" : "rawKeyDown",
+        key: descriptor.key,
+        code: descriptor.code,
+        windowsVirtualKeyCode: descriptor.keyCode,
+        nativeVirtualKeyCode: descriptor.keyCode,
+        modifiers: mask,
+        ...(produces_text ? { text: descriptor.text, unmodifiedText: descriptor.text } : {}),
+        ...(commands.length > 0 ? { commands } : {}),
+      },
+      this._session_id,
+    );
+    await delay(random_between(20, 60));
+    await this._cdp.send(
+      "Input.dispatchKeyEvent",
+      { type: "keyUp", key: descriptor.key, code: descriptor.code, windowsVirtualKeyCode: descriptor.keyCode, nativeVirtualKeyCode: descriptor.keyCode, modifiers: mask },
+      this._session_id,
+    );
+
+    for (const modifier of [...modifiers].reverse()) {
+      await delay(random_between(20, 50));
+      mask &= ~MODIFIER_BITS[modifier];
+      const modifier_descriptor = NAMED_KEYS[modifier];
+      await this._cdp.send(
+        "Input.dispatchKeyEvent",
+        { type: "keyUp", key: modifier_descriptor.key, code: modifier_descriptor.code, windowsVirtualKeyCode: modifier_descriptor.keyCode, nativeVirtualKeyCode: modifier_descriptor.keyCode, modifiers: mask },
+        this._session_id,
+      );
+    }
   }
 
   private async _press(key: string): Promise<void> {

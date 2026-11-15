@@ -84,7 +84,42 @@ export class Element {
     await this._click_normal(humanLike);
   }
 
+  // Click/hover point in page coordinates. An element outside the viewport is
+  // scrolled into view first (like a person scrolls to a button before
+  // clicking it) — input dispatched at off-screen coordinates hits nothing.
   private async _resolve_click_position(): Promise<{ x: number; y: number }> {
+    let position = await this._raw_click_position();
+    const viewport = await this._viewport_size();
+    const outside = (point: { x: number; y: number }): boolean =>
+      viewport !== null && (point.x < 0 || point.y < 0 || point.x > viewport.width || point.y > viewport.height);
+    if (outside(position)) {
+      await this.scrollIntoView();
+      // Smooth scrolling takes a moment over long distances: wait until the
+      // element stops moving.
+      for (let attempt = 0; attempt < 10; attempt++) {
+        const next = await this._raw_click_position();
+        const settled = Math.abs(next.x - position.x) < 1 && Math.abs(next.y - position.y) < 1;
+        position = next;
+        if (settled && !outside(position)) {
+          break;
+        }
+        await delay(120);
+      }
+    }
+    return position;
+  }
+
+  private async _viewport_size(): Promise<{ width: number; height: number } | null> {
+    try {
+      const metrics = await this._cdp.send("Page.getLayoutMetrics");
+      const layout = metrics.cssLayoutViewport ?? metrics.layoutViewport;
+      return layout ? { width: Number(layout.clientWidth), height: Number(layout.clientHeight) } : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async _raw_click_position(): Promise<{ x: number; y: number }> {
     let x = 0;
     let y = 0;
 
@@ -576,28 +611,69 @@ export class Element {
     return Boolean(await this.getProperty({ name: "checked" }));
   }
 
-  // Selects an <option> in a <select> by value and fires input/change so
-  // frameworks listening for the change react as they would to a real choice.
-  async selectOption({ value }: { value: string }): Promise<void> {
+  // Selects an <option> in a <select> by value (or by visible label) and fires
+  // input/change so frameworks listening for the change react as they would to
+  // a real choice. Returns the selected option's { value, label }, or null when
+  // this is not a <select> or no option matches.
+  async selectOption({ value, label }: { value?: string; label?: string }): Promise<{ value: string; label: string } | null> {
     const object_id = await this._resolve_object();
-    await this._cdp.send(
+    const result = await this._cdp.send(
       "Runtime.callFunctionOn",
       {
         objectId: object_id,
         functionDeclaration: `
-          function(value) {
+          function(value, label) {
             if (!(this instanceof HTMLSelectElement)) {
-              return;
+              return null;
             }
-            this.value = value;
+            const norm = (s) => String(s ?? '').replace(/\\s+/g, ' ').trim().toLowerCase();
+            const options = Array.from(this.options);
+            const option =
+              (value != null && options.find((o) => o.value === value)) ||
+              (label != null && (options.find((o) => norm(o.label) === norm(label)) || options.find((o) => norm(o.label).includes(norm(label))))) ||
+              (value != null && options.find((o) => norm(o.label) === norm(value))) ||
+              null;
+            if (!option) {
+              return null;
+            }
+            this.value = option.value;
+            option.selected = true;
             this.dispatchEvent(new Event('input', { bubbles: true }));
             this.dispatchEvent(new Event('change', { bubbles: true }));
+            return { value: option.value, label: option.label };
           }
         `,
-        arguments: [{ value }],
+        arguments: [{ value: value ?? null }, { value: label ?? null }],
+        returnByValue: true,
       },
       this._session_id,
     );
+    return result.result?.value ?? null;
+  }
+
+  // Calls a function with the element as `this` and returns its JSON result.
+  async callFunction({ fn, args = [] }: { fn: string; args?: unknown[] }): Promise<any> {
+    const object_id = await this._resolve_object();
+    const result = await this._cdp.send(
+      "Runtime.callFunctionOn",
+      {
+        objectId: object_id,
+        functionDeclaration: fn,
+        arguments: args.map((value) => ({ value })),
+        returnByValue: true,
+        awaitPromise: true,
+      },
+      this._session_id,
+    );
+    if (result.exceptionDetails) {
+      throw new Error(String(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? "evaluation failed"));
+    }
+    return result.result?.value;
+  }
+
+  // CDP session the element lives in (null = the page itself, else an OOPIF).
+  get sessionId(): string | null {
+    return this._session_id;
   }
 
   // Sets files on an <input type=file> via DOM.setFileInputFiles (the only way
@@ -619,9 +695,13 @@ export class Element {
       return null;
     }
 
+    // Out-of-process iframe boxes are relative to the frame: shift them into
+    // page coordinates, and capture on the page session.
+    const [offset_x, offset_y] = this._iframe_offset;
     const result = await this._cdp.send("Page.captureScreenshot", {
       format: "png",
-      clip: { x: box.x, y: box.y, width: box.width, height: box.height, scale: 1 },
+      clip: { x: box.x + offset_x, y: box.y + offset_y, width: box.width, height: box.height, scale: 1 },
+      captureBeyondViewport: true,
     });
 
     const data = Buffer.from(String(result.data ?? ""), "base64");

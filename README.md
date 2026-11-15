@@ -225,11 +225,31 @@ Or in any MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, â
 | `solve_turnstile` | Solves an interactive Cloudflare Turnstile |
 | `scrape` | One-shot fetch with tier escalation |
 | `check_egress` | Shows whether your exit IP looks like a datacenter |
+| `new_tab` / `list_tabs` / `switch_tab` / `close_tab` | Several tabs in one profile (shared cookies), including popups and `target=_blank` pages the site opens. Every other tool acts on the current tab; refs are per tab |
+| `hover` | Mouse over an element (ref or CSS selector), human-like path |
+| `select_option` | Picks an option in a `<select>` or a custom dropdown/combobox, by label or value |
+| `set_checked` / `clear` | Checkbox/radio/switch state; empties a text field |
+| `fill_form` | Several fields in one call (text, checkboxes, radios, selects) |
+| `upload_file` | Attaches files via the `<input type=file>` or the button that opens the picker (hidden inputs work; no OS dialog) |
+| `scroll` | Mouse-wheel scrolling of the page or an element; infinite feeds until N items or the end |
+| `wait_for` | Text appears/disappears, selector/ref visible, URL change, network idle â€” with a timeout |
+| `evaluate` | Runs JS in the current tab (isolated or main world) and returns JSON |
+| `paste` | Real paste event with clipboard data (OTP boxes), then inserts the text |
+| `press_key` | Keys and shortcuts: `Enter`, `Control+A`, `Shift+Tab`, `ControlOrMeta+V` |
+| `screenshot` | Page, full page, or one element (`ref`/`selector`, iframes included) |
+| `handle_dialog` | Answers alert/confirm/prompt when running with `--dialogs manual` |
+| `wait_for_download` | Waits for a download and returns the saved file path (`--downloads-dir`) |
+| `tab_info` / `reload` / `go_forward` | Cheap state check; reload; history forward |
+| `export_session` / `import_session` | Backs up / restores cookies + localStorage to a JSON file (values never returned to the model) |
+| `close_browser` | Closes Chrome gracefully (cookies flushed). The next call relaunches on the same profile, which also happens automatically if Chrome crashed or the user closed it |
 
 **Guard rails:**
 
 - `--allowed-domains a.com,b.com` refuses navigation elsewhere, and rolls back clicks that leave the list.
 - `--secrets .env` lets the agent type `{{PASSWORD}}`. The value is filled in at keystroke time and redacted from everything returned.
+- `--dialogs accept|dismiss|manual` decides how JS dialogs are answered (default `accept`; every auto-answer is reported). In `manual` mode the action returns as soon as a dialog opens and the agent answers it with `handle_dialog`; nothing hangs.
+- `--downloads-dir <dir>` is where `wait_for_download` finds files (saved under the site's file name).
+- With `--user-data-dir`, a second Chrome on the same profile fails fast with a clear "already in use" error instead of a launch timeout.
 - Page content always comes back inside `<untrusted-page-content>` markers.
 - Other options: `--proxy`, `--headful`, `--user-data-dir`, `--geo BR`. The server is also listed for the MCP Registry (`server.json`), and an [Agent Skill](./skills/browser-scraper/SKILL.md) is included.
 

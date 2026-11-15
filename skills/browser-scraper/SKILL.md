@@ -41,7 +41,9 @@ For login flows, forms and pagination, use the MCP server. It keeps one browser 
 claude mcp add browser-scraper -- npx -y @eurafaeldecarvalho/browser-scraper mcp --allowed-domains example.com
 ```
 
-Tools: `navigate`, `snapshot`, `click`, `type`, `press_key`, `go_back`, `wait`, `markdown`, `metadata`, `screenshot`, `solve_turnstile`, `scrape`, `check_egress`.
+Tools: `navigate`, `snapshot`, `click`, `type`, `press_key` (shortcuts like `Control+A`), `go_back`, `go_forward`, `reload`, `wait`, `wait_for`, `markdown`, `metadata`, `screenshot`, `solve_turnstile`, `scrape`, `check_egress`; tabs: `new_tab`, `list_tabs`, `switch_tab`, `close_tab`; forms: `fill_form`, `select_option`, `set_checked`, `clear`, `upload_file`, `paste`, `hover`, `scroll`; misc: `evaluate`, `handle_dialog`, `wait_for_download`, `tab_info`, `export_session`, `import_session`, `close_browser`.
+
+Tabs share one profile: keep a login form open in one tab, `new_tab` the mailbox to read the code, `switch_tab` back. Refs belong to the tab they came from; use the snapshot returned by `switch_tab`.
 
 - To pass credentials, run the server with `--secrets .env` and type `{{NAME}}` placeholders. Never ask the user to paste passwords into the chat.
 

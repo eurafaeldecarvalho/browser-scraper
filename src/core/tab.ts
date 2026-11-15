@@ -70,6 +70,9 @@ export class Tab {
   private readonly _world_name = `u${randomBytes(8).toString("hex")}`;
   private _oop_frame_sessions = new Map<string, string>();
   private _snapshot_refs = new Map<string, SnapshotRef>();
+  // In-flight network requests of this page, for waitForNetworkIdle().
+  private _inflight = new Set<string>();
+  private _last_network_activity = Date.now();
   private _network: Network | null = null;
   private _proxy_auth: [string, string] | null;
   private _user_agent: string | null;
@@ -122,6 +125,23 @@ export class Tab {
     // which are plain commands that do not require the Runtime domain to be
     // enabled. Context invalidation is handled via Page.frameNavigated and
     // stale-context-error retries instead of Runtime.executionContext* events.
+
+    const settle = (params: Record<string, any>): void => {
+      this._inflight.delete(String(params.requestId));
+      this._last_network_activity = Date.now();
+    };
+    this._cdp.on("Network.requestWillBeSent", (params) => {
+      this._inflight.add(String((params as Record<string, any>).requestId));
+      this._last_network_activity = Date.now();
+    });
+    this._cdp.on("Network.loadingFinished", (params) => settle(params as Record<string, any>));
+    this._cdp.on("Network.loadingFailed", (params) => settle(params as Record<string, any>));
+    // A long-poll/websocket that never finishes must not block "idle" forever:
+    // requests older than 15 s stop counting.
+    this._cdp.on("Network.responseReceived", (params) => {
+      const id = String((params as Record<string, any>).requestId);
+      setTimeout(() => this._inflight.delete(id), 15_000).unref?.();
+    });
 
     this._cdp.on("Page.frameNavigated", (params) => {
       this._on_frame_navigated(params as Record<string, any>);
@@ -717,6 +737,34 @@ export class Tab {
         this._cdp.off("Page.lifecycleEvent", event_handler);
       }
     }
+  }
+
+  // Resolves once the page has had at most `maxInflight` requests in flight for
+  // `idleMs` straight (networkidle0 = 0, networkidle2 = 2). Throws on timeout.
+  async waitForNetworkIdle({
+    idleMs = 500,
+    maxInflight = 0,
+    timeout = 30_000,
+  }: { idleMs?: number; maxInflight?: number; timeout?: number } = {}): Promise<void> {
+    const deadline = Date.now() + timeout;
+    let quiet_since = 0;
+    while (Date.now() < deadline) {
+      if (this._inflight.size <= maxInflight) {
+        quiet_since = quiet_since || Math.max(Date.now() - 100, maxInflight === 0 ? this._last_network_activity : 0);
+        if (Date.now() - quiet_since >= idleMs) {
+          return;
+        }
+      } else {
+        quiet_since = 0;
+      }
+      await delay(100);
+    }
+    throw new Error(`Timeout waiting for network idle (${this._inflight.size} requests still in flight)`);
+  }
+
+  // Raw CDP client of this page, for advanced callers (downloads, DOMStorage…).
+  get cdp(): CDPClient {
+    return this._cdp;
   }
 
   async reload({ timeout = 30_000 }: { timeout?: number } = {}): Promise<void> {
