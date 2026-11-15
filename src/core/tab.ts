@@ -2475,6 +2475,23 @@ export class Tab {
     await this._cdp.send("Emulation.setLocaleOverride", { locale });
   }
 
+  // Drops geolocation/timezone/locale overrides set at runtime and restores the
+  // launch baseline (stealth geo, or Chrome's defaults incl. Accept-Language).
+  async resetEmulation(): Promise<void> {
+    await this._cdp.send("Emulation.clearGeolocationOverride").catch(() => undefined);
+    await this._cdp.send("Emulation.setTimezoneOverride", { timezoneId: "" }).catch(() => undefined);
+    await this._cdp.send("Emulation.setLocaleOverride", {}).catch(() => undefined);
+    if (this._user_agent) {
+      await this._cdp.send("Network.setUserAgentOverride", {
+        userAgent: this._user_agent,
+        userAgentMetadata: buildUserAgentMetadata(this._user_agent, this._full_version, this._grease),
+      });
+    }
+    // (Without a UA override the header came from setExtraHTTPHeaders, which may
+    // carry other caller headers: left as is.)
+    await this._apply_geo();
+  }
+
   // Aligns every geo-derived signal in one call so they can't contradict each
   // other (a cross-layer mismatch is a strong bot signal). When proxying through
   // another country, pass that region's locale/timezone. acceptLanguage is set

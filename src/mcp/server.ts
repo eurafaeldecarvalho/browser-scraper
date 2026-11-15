@@ -59,7 +59,7 @@ type ToolResult = { content: ToolContent[]; isError?: boolean };
 // A context is stale once its call timed out (generation moved on) or the work
 // was abandoned (a manual dialog returned control first); every CDP command
 // and every state change from a stale context is refused.
-type CallContext = { generation: number; abandoned: boolean; parent: CallContext | null };
+type CallContext = { generation: number; abandoned: boolean; parent: CallContext | null; quiet?: boolean };
 
 // Tools raced against a manual dialog opening on the current tab: none of these
 // touch the current page's renderer, so a dialog cannot freeze them.
@@ -107,6 +107,17 @@ const MAX_NETWORK_ENTRIES = 1_000;
 // drop_files refuses more than this in total (files travel over CDP as base64
 // only on the paste path; drops pass file paths).
 const MAX_DROP_BYTES = 50 * 1024 * 1024;
+
+// Stored URL length per recorded request: data: URLs can be megabytes each and
+// the ring keeps 1000 of them.
+const MAX_STORED_URL = 2_048;
+// response_body refuses bodies larger than this (the whole body crosses CDP
+// and is held in memory before truncation).
+const MAX_BODY_BYTES = 10 * 1024 * 1024;
+
+export function clip_url(url: string): string {
+  return url.length > MAX_STORED_URL ? `${url.slice(0, MAX_STORED_URL)}…` : url;
+}
 
 // Notes kept between two tool results; a dialog loop or a window.open storm
 // must not grow memory or flood the agent's context.
@@ -183,8 +194,6 @@ export class McpServer {
   private _call_seq = 0;
   private _emulation: Emulation = {};
   private _started_at = Date.now();
-  // Inside batch: steps before the last skip the snapshot (nobody reads it).
-  private _quiet_snapshots = false;
 
   constructor(options: McpServerOptions = {}) {
     this._options = options;
@@ -353,6 +362,17 @@ export class McpServer {
     } catch {
       // The page is gone or unreachable: the next call says so.
     }
+  }
+
+  // Inside batch: steps before the last skip the snapshot (nobody reads it).
+  // Kept on the call's own context so a stale or concurrent call cannot flip it.
+  private _quiet(): boolean {
+    for (let context = this._call_context.getStore() ?? null; context; context = context.parent) {
+      if (context.quiet !== undefined) {
+        return context.quiet;
+      }
+    }
+    return false;
   }
 
   // True inside a call that timed out and was abandoned.
@@ -883,6 +903,7 @@ export class McpServer {
   private _forget_target(target_id: string): void {
     this._pending_dialogs.delete(target_id);
     this._wired.delete(target_id);
+    this._last_snapshots.delete(target_id);
     void this._browser?.forgetTab(target_id);
   }
 
@@ -945,7 +966,7 @@ export class McpServer {
     if (notes) {
       text += `\n${notes}`;
     }
-    if (snapshot && !this._quiet_snapshots) {
+    if (snapshot && !this._quiet()) {
       text += `\n\n${await this._snapshot_text(tab, this._options.snapshotMode ?? "full")}`;
     }
     return text;
@@ -977,7 +998,7 @@ export class McpServer {
       const existing = find(params);
       if (existing) {
         // Redirect: same request id, new URL.
-        existing.url = String(params.request?.url ?? existing.url);
+        existing.url = clip_url(String(params.request?.url ?? existing.url));
         existing.status = 0;
         return;
       }
@@ -992,7 +1013,7 @@ export class McpServer {
         targetId: target_id,
         requestId: String(params.requestId),
         method: String(params.request?.method ?? "GET"),
-        url: String(params.request?.url ?? ""),
+        url: clip_url(String(params.request?.url ?? "")),
         type: String(params.type ?? "Other"),
         status: 0,
         mimeType: "",
@@ -1060,6 +1081,9 @@ export class McpServer {
     if (entry.state !== "finished") {
       throw new Error(`${entry.id} has no body (${entry.state === "failed" ? `failed: ${entry.error}` : "still loading"}).`);
     }
+    if (entry.size > MAX_BODY_BYTES) {
+      throw new Error(`${entry.id} body is ${format_bytes(entry.size)}; response_body reads at most ${format_bytes(MAX_BODY_BYTES)}.`);
+    }
     let result: Record<string, any>;
     try {
       result = await entry.cdp.send("Network.getResponseBody", { requestId: entry.requestId });
@@ -1086,16 +1110,24 @@ export class McpServer {
 
   // Viewport point inside an element (scrolled into view), slightly off-center
   // like a person aims. Only elements of the page itself (no iframe content).
-  private async _point_of(tab: Tab, ref: unknown, selector: unknown, x: unknown, y: unknown, label: string): Promise<{ x: number; y: number }> {
+  private async _point_of(tab: Tab, ref: unknown, selector: unknown, x: unknown, y: unknown, label: string, scroll = true): Promise<{ x: number; y: number }> {
     if (ref || selector) {
       const element = (await this._target(tab, ref, selector)) as Element;
       if (element.sessionId) {
         throw new Error(`${label} is inside a cross-origin iframe: use click_at with viewport coordinates (screenshot shows them).`);
       }
-      await element.scrollIntoView();
+      if (scroll) {
+        await element.scrollIntoView();
+      }
       const box = await element.boundingBox();
       if (!box || box.width === 0 || box.height === 0) {
         throw new Error(`${label} (${String(ref ?? selector)}) has no visible box.`);
+      }
+      if (!scroll) {
+        // Measured after something else scrolled: it must still be on screen.
+        await this._viewport_point(tab, box.x + box.width / 2, box.y + box.height / 2).catch(() => {
+          throw new Error(`${label} and the drop target are not both visible in the viewport; scroll so both are on screen, or use coordinates.`);
+        });
       }
       return { x: box.x + box.width * (0.4 + Math.random() * 0.2), y: box.y + box.height * (0.4 + Math.random() * 0.2) };
     }
@@ -1267,7 +1299,7 @@ export class McpServer {
   }
 
   // reCAPTCHA v2 / hCaptcha widget state on the page (main document).
-  private async _captcha_state(tab: Tab): Promise<{ kind: string; anchorSelector: string; checkboxX: number; anchor: Box | null; challenge: Box | null; solved: boolean } | null> {
+  private async _captcha_state(tab: Tab): Promise<{ kind: string; anchorSelector: string; challengeSelector: string; checkboxX: number; anchor: Box | null; challenge: Box | null; solved: boolean } | null> {
     const kinds = [
       {
         kind: "reCAPTCHA",
@@ -1304,7 +1336,7 @@ export class McpServer {
           const anchor = anchors.find((a) => box(a)) || anchors[0];
           const solved = Array.from(document.querySelectorAll(k.token)).some((t) => (t.value || '').length > 0);
           const challenge = Array.from(document.querySelectorAll(k.challenge)).map(box).find(Boolean) || null;
-          return { kind: k.kind, anchorSelector: k.anchor, checkboxX: k.checkboxX, anchor: box(anchor), challenge, solved };
+          return { kind: k.kind, anchorSelector: k.anchor, challengeSelector: k.challenge, checkboxX: k.checkboxX, anchor: box(anchor), challenge, solved };
         }
         return null;
       })()`,
@@ -1704,7 +1736,7 @@ export class McpServer {
     if (!raw || !isAbsolute(raw)) {
       throw new Error(`path must be an absolute file path (got "${raw}").`);
     }
-    const path = resolve_path(raw);
+    const path = local_path(raw);
     if (extname(path).toLowerCase() !== ".json") {
       throw new Error("path must end in .json.");
     }
@@ -2312,7 +2344,7 @@ export class McpServer {
           if (relative !== undefined) {
             throw new Error(`Paths must be absolute (got "${relative}").`);
           }
-          const paths = raw.map((path) => resolve_path(path));
+          const paths = raw.map((path) => local_path(path));
           for (const path of paths) {
             if (!existsSync(path) || !statSync(path).isFile()) {
               throw new Error(`File not found: ${path}`);
@@ -2675,8 +2707,8 @@ export class McpServer {
             throw new Error("Give text and/or role.");
           }
           const tab = await this._ready_tab();
+          // Not a diff base: the agent sees only the matches, not this outline.
           const snap = await tab.snapshot();
-          this._last_snapshots.set(tab.target_id, snap);
           const found = find_in_snapshot(snap, {
             text: args.text !== undefined ? String(args.text) : undefined,
             role: args.role !== undefined ? String(args.role) : undefined,
@@ -2742,8 +2774,10 @@ export class McpServer {
         },
         run: async (args) => {
           const tab = await this._ready_tab();
-          const from = await this._point_of(tab, args.ref, args.selector, args.fromX, args.fromY, "drag source");
+          const first = await this._point_of(tab, args.ref, args.selector, args.fromX, args.fromY, "drag source");
           const to = await this._point_of(tab, args.toRef, args.toSelector, args.toX, args.toY, "drop target");
+          // Scrolling the target into view may have moved the source: measure it again.
+          const from = args.ref || args.selector ? await this._point_of(tab, args.ref, args.selector, undefined, undefined, "drag source", false) : first;
           const drag = async (): Promise<void> => {
             await tab.mouse.moveTo(from);
             await delay(80 + Math.random() * 120);
@@ -2793,7 +2827,7 @@ export class McpServer {
           if (relative !== undefined) {
             throw new Error(`Paths must be absolute (got "${relative}").`);
           }
-          const paths = raw.map((path) => resolve_path(path));
+          const paths = raw.map((path) => local_path(path));
           let total = 0;
           for (const path of paths) {
             if (!existsSync(path) || !statSync(path).isFile()) {
@@ -3020,6 +3054,9 @@ export class McpServer {
             return text(`Cookie ${String(args.name)} set for ${url}.`);
           }
           if (action === "delete") {
+            if (args.domain !== undefined) {
+              this._check_url(`https://${String(args.domain).replace(/^\./, "")}/`);
+            }
             await tab.cdp.send("Network.deleteCookies", { name: String(args.name), url, ...(args.domain ? { domain: String(args.domain) } : {}), ...(args.path ? { path: String(args.path) } : {}) });
             return text(`Cookie ${String(args.name)} deleted for ${url}.`);
           }
@@ -3038,7 +3075,7 @@ export class McpServer {
             if (!isAbsolute(raw) || extname(raw).toLowerCase() !== ".pdf") {
               throw new Error(`path must be an absolute .pdf file path (got "${raw}").`);
             }
-            path = resolve_path(raw);
+            path = local_path(raw);
             if (!existsSync(dirname(path))) {
               throw new Error(`Folder does not exist: ${dirname(path)}`);
             }
@@ -3082,10 +3119,16 @@ export class McpServer {
         run: async (args) => {
           const tab = await this._get_tab();
           if (args.reset) {
+            const had_geolocation = this._emulation.latitude !== undefined;
             this._emulation = {};
-            await tab.cdp.send("Emulation.clearGeolocationOverride").catch(() => undefined);
-            await tab.cdp.send("Emulation.setTimezoneOverride", { timezoneId: "" }).catch(() => undefined);
-            await tab.cdp.send("Emulation.setLocaleOverride", {}).catch(() => undefined);
+            if (had_geolocation && this._browser_cdp) {
+              // Without the override, a still-granted permission would hand
+              // every site the PC's REAL location.
+              await this._browser_cdp.send("Browser.resetPermissions").catch(() => undefined);
+            }
+            // Back to the launch baseline (--geo / stealth locale, timezone and
+            // Accept-Language), so navigator.languages matches the locale again.
+            await tab.resetEmulation().catch(() => undefined);
             return text("Emulation overrides cleared.");
           }
           if ((args.latitude === undefined) !== (args.longitude === undefined)) {
@@ -3177,6 +3220,18 @@ export class McpServer {
             return text(`${now.kind}: solved (token present).`);
           }
           if (now.challenge) {
+            const [, view_height] = (await tab.evaluate({ expression: "[innerWidth, innerHeight]" })) as [number, number];
+            if (now.challenge.y < 0 || now.challenge.y + now.challenge.height > view_height) {
+              // Accepted up to 3 screens down: bring it on screen so click_at
+              // (viewport-only) can reach the tiles at the reported coordinates.
+              await tab.evaluate({
+                expression: `(() => { const el = Array.from(document.querySelectorAll(${JSON.stringify(now.challengeSelector)})).find((f) => f.getBoundingClientRect().height >= 20); if (el) el.scrollIntoView({ block: "center" }); })()`,
+              });
+              await tab.sleep({ milliseconds: 400 });
+              now = (await this._captcha_state(tab)) ?? now;
+            }
+          }
+          if (now.challenge) {
             const box = now.challenge;
             const content: ToolContent[] = [
               {
@@ -3234,10 +3289,11 @@ export class McpServer {
             this._assert_current();
             const tool = this._tools.find((candidate) => candidate.name === String(step.tool)) as ToolDef;
             const final = index === steps.length - 1;
-            this._quiet_snapshots = !final;
             let result: ToolResult;
             try {
-              result = await tool.run(step.args && typeof step.args === "object" ? step.args : {});
+              const parent = this._call_context.getStore() ?? null;
+              const context: CallContext = { generation: parent?.generation ?? this._generation, abandoned: false, parent, quiet: !final };
+              result = await this._call_context.run(context, () => tool.run(step.args && typeof step.args === "object" && !Array.isArray(step.args) ? step.args : {}));
             } catch (error) {
               const message = String((error as Error)?.message ?? error);
               if (RELAUNCH_ERROR.test(message)) {
@@ -3248,12 +3304,9 @@ export class McpServer {
               if (args.stopOnError ?? true) {
                 lines.push(`Stopped at step ${index + 1}; later steps were not run.`);
                 const tab = this._tab;
-                this._quiet_snapshots = false;
                 return { content: [{ type: "text", text: `${lines.join("\n")}${tab ? `\n\n${await this._page_state(tab).catch(() => "")}` : ""}` }, ...extra], isError: true };
               }
               continue;
-            } finally {
-              this._quiet_snapshots = false;
             }
             if (final) {
               last = result;
@@ -3263,6 +3316,11 @@ export class McpServer {
               const summary = (first?.text ?? "").split("\n").filter((line) => line && !/^(Tab|Page|URL): /.test(line) && !line.includes("untrusted-page-content"))[0] ?? "";
               lines.push(`${index + 1}. ${tool.name}: ${result.isError ? "ERROR " : "ok"}${summary ? ` — ${summary.slice(0, 200)}` : ""}`);
               extra.push(...result.content.filter((part) => part.type === "image"));
+              if (result.isError && (args.stopOnError ?? true)) {
+                lines.push(`Stopped at step ${index + 1}; later steps were not run.`);
+                const tab = this._tab;
+                return { content: [{ type: "text", text: `${lines.join("\n")}${tab ? `\n\n${await this._page_state(tab).catch(() => "")}` : ""}` }, ...extra], isError: true };
+              }
             }
           }
           const tail = last?.content ?? [];
@@ -3309,6 +3367,22 @@ export class McpServer {
 }
 
 type Box = { x: number; y: number; width: number; height: number };
+
+// Absolute path on a local disk. UNC / device paths (\\host\share, //host,
+// \\?\..., \\.\...) are refused BEFORE any fs call: on Windows merely stat-ing
+// \\attacker\x makes the OS authenticate to that host over SMB (NTLM hash
+// leak), and a hostile page can talk the agent into such a path.
+export function local_path(raw: string): string {
+  const value = String(raw);
+  if (/^[\\/]{2}/.test(value) || /^[\\/][?.][\\/]/.test(value)) {
+    throw new Error(`Network/device paths are not allowed (got "${value}"); use a path on a local disk.`);
+  }
+  const path = resolve_path(value);
+  if (/^[\\/]{2}/.test(path)) {
+    throw new Error(`Network/device paths are not allowed (got "${value}"); use a path on a local disk.`);
+  }
+  return path;
+}
 
 export function format_bytes(bytes: number): string {
   return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${bytes} B`;
@@ -3519,7 +3593,7 @@ export function read_session_file(raw_path: string): SessionFile {
   if (!raw_path || !isAbsolute(raw_path)) {
     throw new Error(`path must be an absolute file path (got "${raw_path}").`);
   }
-  const path = resolve_path(raw_path);
+  const path = local_path(raw_path);
   if (!existsSync(path) || !statSync(path).isFile()) {
     throw new Error(`File not found: ${path}`);
   }

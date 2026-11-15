@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { findOrphanChrome, McpServer, OWNER_FILE, parseEnvFile, processInfo, profileInUse } from "../../src/index";
 import { parseKeyCombo } from "../../src/behavior/keyboard";
-import { find_in_snapshot, find_option, format_bytes, installShutdownHandlers, mime_for, read_session_file, safe_filename, snapshot_diff, wait_timeout_ms } from "../../src/mcp/server";
+import { clip_url, find_in_snapshot, find_option, local_path, format_bytes, installShutdownHandlers, mime_for, read_session_file, safe_filename, snapshot_diff, wait_timeout_ms } from "../../src/mcp/server";
 import { renderSnapshot } from "../../src/content/snapshot";
 import { CDPClient, runUnguarded } from "../../src/core/cdp-client";
 
@@ -780,4 +780,17 @@ test("format_bytes and mime_for", () => {
   assert.equal(mime_for("C:/x/Photo.JPG"), "image/jpeg");
   assert.equal(mime_for("/x/clip.mp4"), "video/mp4");
   assert.equal(mime_for("/x/file.unknown"), "application/octet-stream");
+});
+
+test("local_path refuses UNC and device paths before touching the filesystem", () => {
+  for (const bad of ["\\\\attacker\\share\\a.png", "//attacker/share/a.png", "\\\\?\\C:\\x.pdf", "\\\\.\\pipe\\x", "/\\attacker\\x"]) {
+    assert.throws(() => local_path(bad), /Network\/device paths/, bad);
+  }
+  assert.ok(local_path(join(tmpdir(), "a.pdf")).endsWith("a.pdf"));
+});
+
+test("clip_url bounds stored request URLs", () => {
+  const data = `data:image/png;base64,${"A".repeat(5_000_000)}`;
+  assert.ok(clip_url(data).length <= 2_049);
+  assert.equal(clip_url("https://x.test/a"), "https://x.test/a");
 });

@@ -110,6 +110,11 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
 
     const same = await tool("snapshot", { diff: true });
     assert.match(same.text, /no changes since the last snapshot/);
+    // find shows only matches: it must not become the diff base, or a change
+    // made before it would never reach the agent.
+    await tool("evaluate", { expression: "document.body.insertAdjacentHTML('afterbegin', '<h2>Injected heading</h2>')", world: "main" });
+    assert.match((await tool("find", { text: "needle" })).text, /Needle button/);
+    assert.match((await tool("snapshot", { diff: true })).text, /\+ .*Injected heading/);
     const full = await tool("snapshot");
     assert.match(full.text, /button "Needle button" \[ref=e\d+\]/);
   });
@@ -215,6 +220,20 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
     out = await tool("emulate", { timezone: "Not/AZone" });
     assert.equal(out.isError, true);
     await tool("emulate", { reset: true });
+    // reset must not leave geolocation granted (sites would get the real location)
+    // nor the emulated locale in navigator.languages.
+    const languages = async (): Promise<any> => json((await tool("evaluate", { expression: "navigator.permissions.query({ name: 'geolocation' }).then((p) => [p.state, navigator.languages.join(',')])", world: "main" })).text);
+    assert.notEqual((await languages())[0], "granted");
+    await tool("emulate", { locale: "de-DE" });
+    assert.match((await languages())[1], /de-DE/);
+    await tool("emulate", { reset: true });
+    assert.doesNotMatch((await languages())[1], /de-DE/);
+
+    out = await tool("save_pdf", { path: "\\\\127.0.0.1\\share\\x.pdf" });
+    assert.equal(out.isError, true);
+    assert.match(out.text, /Network\/device paths are not allowed/);
+    out = await tool("drop_files", { selector: "body", paths: ["//127.0.0.1/share/a.png"] });
+    assert.match(out.text, /Network\/device paths are not allowed/);
 
     out = await tool("save_pdf", {});
     assert.equal(out.isError, false, out.text);
@@ -241,6 +260,10 @@ describe("mcp agent tools over stdio (e2e)", { skip: chrome ? false : "Chrome no
     out = await tool("batch", { steps: [{ tool: "click", args: { ref: "e999999" } }, { tool: "snapshot" }] });
     assert.equal(out.isError, true);
     assert.match(out.text, /1\. click: ERROR .*Unknown ref[\s\S]*Stopped at step 1/);
+    // A step that returns isError (not a throw) also stops the batch.
+    out = await tool("batch", { steps: [{ tool: "emulate", args: { timezone: "Not/AZone" } }, { tool: "snapshot" }] });
+    assert.equal(out.isError, true);
+    assert.match(out.text, /Stopped at step 1/);
     out = await tool("batch", { steps: [{ tool: "batch", args: {} }] });
     assert.match(out.text, /cannot be nested/);
   });
