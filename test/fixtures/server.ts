@@ -104,6 +104,13 @@ const feed=document.getElementById('feed');let n=0;
 function more(){for(let i=0;i<10&&n<50;i++){const d=document.createElement('div');d.className='item';d.style.height='40px';d.textContent='Item '+(++n);feed.appendChild(d)}}
 more();feed.addEventListener('scroll',()=>{if(feed.scrollTop+feed.clientHeight>=feed.scrollHeight-20)setTimeout(more,200)});
 </script></body></html>`,
+  "/hostile": () => `<!doctype html><html><head><title>Hostile</title></head><body><h1>Hostile</h1>
+<button onclick="for(let i=0;i<60;i++)alert('spam '+i);document.getElementById('done').textContent='spam done'">Spam alerts</button><span id="done"></span>
+<button onclick="for(let i=0;i<12;i++)window.open('/products','_blank')">Open many</button>
+<label>Photo <input type="file" id="photo"></label><label>Resume <input type="file" id="resume"></label>
+<button id="noop">Attach</button>
+<a href="/evil-download">Evil download</a>
+</body></html>`,
   "/form-frame": () => `<!doctype html><html><body><label>Frame field <input id="ff"></label><button onclick="document.getElementById('fo').textContent='frame got:'+document.getElementById('ff').value">Frame submit</button><p id="fo"></p></body></html>`,
   "/blocked": () => `<!doctype html><html><head><title>Just a moment...</title></head><body><div id="challenge-running">Checking your browser</div><script>window._cf_chl_opt={}</script></body></html>`,
   "/spa": () => `<!doctype html><html><head><title>SPA</title></head><body><div id="root"></div><noscript>You need to enable JavaScript to run this app.</noscript><script>document.getElementById('root').innerHTML='<main><h1>Rendered by JS</h1><p>' + 'This content only exists after JavaScript runs. '.repeat(5) + '</p></main>'</script></body></html>`,
@@ -121,6 +128,11 @@ export async function startFixtureServer(): Promise<FixtureServer> {
     if (path === "/download.txt") {
       res.writeHead(200, { "content-type": "text/plain", "content-disposition": 'attachment; filename="report.txt"' });
       res.end("quarterly report\n");
+      return;
+    }
+    if (path === "/evil-download") {
+      res.writeHead(200, { "content-type": "text/plain", "content-disposition": 'attachment; filename="../../evil.txt"' });
+      res.end("evil\n");
       return;
     }
     const page = PAGES[path];

@@ -668,6 +668,16 @@ export class Browser {
     }
   }
 
+  // Drops a Tab whose page target is already gone (closed by the page or the
+  // user): closes its CDP connection without asking Chrome to close anything.
+  async forgetTab(targetId: string): Promise<void> {
+    const gone = this._tabs.filter((tab) => tab.target_id === targetId);
+    this._tabs = this._tabs.filter((tab) => tab.target_id !== targetId);
+    for (const tab of gone) {
+      await tab.close().catch(() => undefined);
+    }
+  }
+
   // Connects to a page target this library did not open itself — a popup
   // ("Continue with Google"), a target=_blank link, window.open(). It gets the
   // same stealth overrides as newTab(); they apply from the next document load
@@ -744,7 +754,9 @@ export class Browser {
       console.warn(`[browser-scraper] checkEgress: could not determine the exit IP (all lookups failed). Last error: ${String(last_error)}`);
       return null;
     } finally {
-      await tab.close();
+      // closeTab, not tab.close(): the latter only drops the CDP connection and
+      // would leave the lookup page open in the browser.
+      await this.closeTab(tab);
     }
   }
 

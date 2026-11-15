@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, extname, join, resolve as resolve_path } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve as resolve_path } from "node:path";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -37,6 +37,9 @@ export type McpServerOptions = {
   dialogPolicy?: "accept" | "dismiss" | "manual";
   // Where downloads are saved (default: <tmp>/browser-scraper-downloads).
   downloadsDir?: string;
+  // Upper bound for one tool call in ms (default 180 s; longer for
+  // wait_for_download, scroll and scrape).
+  toolTimeoutMs?: number;
   // Input/output streams (default stdin/stdout); stderr is used for logs.
   input?: NodeJS.ReadableStream;
   output?: NodeJS.WritableStream;
@@ -48,9 +51,28 @@ type ToolContent = { type: "text"; text: string } | { type: "image"; data: strin
 type ToolResult = { content: ToolContent[]; isError?: boolean };
 
 type PendingDialog = { dialog: Dialog; type: string; message: string; defaultPrompt: string };
-type DownloadEntry = { guid: string; url: string; suggestedFilename: string; state: "inProgress" | "completed" | "canceled"; path: string | null; reported: boolean };
+type DownloadEntry = { guid: string; url: string; suggestedFilename: string; state: "inProgress" | "completed" | "canceled"; path: string | null; reported: boolean; noted: boolean };
 
 const RELAUNCH_ERROR = /ECONNREFUSED|ECONNRESET|fetch failed|CDP WebSocket|CDP connection closed|socket hang up|Target closed/i;
+
+// Tools that are safe to run again on a freshly relaunched browser: they do not
+// act on a page that no longer exists, and repeating them has no side effect.
+// Anything else (click, type, upload…) reports the relaunch instead of being
+// silently retried against a blank page.
+const RETRY_AFTER_RELAUNCH = new Set(["navigate", "new_tab", "list_tabs", "tab_info", "scrape", "check_egress", "import_session", "export_session"]);
+
+// Upper bound for one tool call. Tool calls are serialized, so a call stuck on a
+// frozen page (while(true){} in page JS, a renderer hang) would otherwise block
+// every later call of the bot forever.
+const TOOL_TIMEOUT_MS = 180_000;
+const LONG_TOOL_TIMEOUT_MS: Record<string, number> = { wait_for_download: 630_000, scroll: 600_000, scrape: 300_000 };
+
+// Notes kept between two tool results; a dialog loop or a window.open storm
+// must not grow memory or flood the agent's context.
+const MAX_NOTES = 20;
+
+// import_session refuses bigger files (a real session export is a few hundred KB).
+const MAX_SESSION_FILE_BYTES = 20 * 1024 * 1024;
 
 type ToolDef = {
   name: string;
@@ -98,6 +120,9 @@ export class McpServer {
   private _downloads: DownloadEntry[] = [];
   private _downloads_dir: string;
   private _browser_cdp: CDPClient | null = null;
+  // Startup targets recorded + downloads wired for the current browser.
+  private _browser_setup = false;
+  private _downloads_error: string | null = null;
   private _tools: ToolDef[];
   private _out: NodeJS.WritableStream;
 
@@ -148,6 +173,7 @@ export class McpServer {
       await this._browser.close().catch(() => undefined);
     }
     this._browser = null;
+    this._browser_setup = false;
     this._tab = null;
     this._tab_ids.clear();
     this._next_tab_id = 1;
@@ -155,12 +181,42 @@ export class McpServer {
     this._seen_targets.clear();
     this._wired.clear();
     this._pending_dialogs.clear();
+    // The browser that was writing them is gone: they will never complete.
+    for (const download of this._downloads) {
+      if (download.state === "inProgress") {
+        download.state = "canceled";
+      }
+    }
+  }
+
+  private _note(note: string): void {
+    this._notes.push(note);
+    if (this._notes.length > MAX_NOTES) {
+      const dropped = this._notes.length - MAX_NOTES + 1;
+      const previous = /^\((\d+) earlier note\(s\) dropped\)$/.exec(this._notes[0]);
+      const total = dropped + (previous ? Number(previous[1]) - 1 : 0);
+      this._notes.splice(0, dropped, `(${total} earlier note(s) dropped)`);
+    }
   }
 
   // Runs a tool; if Chrome is gone (the user closed it, it crashed) the browser
   // is relaunched on the same profile and the call retried once, instead of
   // every later call failing with ECONNREFUSED.
   private async _run_tool(tool: ToolDef, args: Record<string, any>): Promise<ToolResult> {
+    const limit = this._options.toolTimeoutMs ?? LONG_TOOL_TIMEOUT_MS[tool.name] ?? TOOL_TIMEOUT_MS;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${tool.name} did not finish within ${Math.round(limit / 1_000)}s (the page may be frozen). Try snapshot, reload or close_tab.`)), limit);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([this._run_tool_inner(tool, args), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async _run_tool_inner(tool: ToolDef, args: Record<string, any>): Promise<ToolResult> {
     if (tool.name !== "close_browser" && this._browser?.launched && !this._browser.alive) {
       await this._relaunch_notice();
     }
@@ -183,13 +239,16 @@ export class McpServer {
         }
       }
       await this._relaunch_notice();
+      if (!RETRY_AFTER_RELAUNCH.has(tool.name)) {
+        throw new Error(`The browser had closed or crashed during ${tool.name}; it was relaunched on the same profile (cookies kept) but the page is gone and the action was NOT repeated. Navigate again, then retry.`);
+      }
       return tool.run(args);
     }
   }
 
   private async _relaunch_notice(): Promise<void> {
     await this.close();
-    this._notes.push("The browser had been closed or crashed; it was relaunched on the same profile (cookies kept). Pages that were open are gone — navigate again if needed.");
+    this._note("The browser had been closed or crashed; it was relaunched on the same profile (cookies kept). Pages that were open are gone — navigate again if needed.");
   }
 
   // Exposed for tests: handle one message and return the response (if any).
@@ -329,14 +388,17 @@ export class McpServer {
 
   private async _launched_browser(): Promise<Browser> {
     const browser = this._ensure_browser();
-    if (!browser.launched) {
+    if (!browser.launched || !this._browser_setup) {
+      this._browser_setup = true;
       await browser.launch();
       for (const target of await browser.getTabs()) {
         if (target.type === "page") {
           this._startup_targets.add(String(target.id));
         }
       }
+      this._downloads_error = null;
       await this._setup_downloads().catch((error) => {
+        this._downloads_error = String(error?.message ?? error);
         process.stderr.write(`[browser-scraper mcp] downloads disabled: ${String(error?.message ?? error)}\n`);
       });
     }
@@ -356,7 +418,7 @@ export class McpServer {
     this._browser_cdp = cdp;
     cdp.on("Browser.downloadWillBegin", (params) => {
       const p = params as Record<string, any>;
-      this._downloads.push({ guid: String(p.guid), url: String(p.url ?? ""), suggestedFilename: String(p.suggestedFilename ?? "download"), state: "inProgress", path: null, reported: false });
+      this._downloads.push({ guid: String(p.guid), url: String(p.url ?? ""), suggestedFilename: String(p.suggestedFilename ?? "download"), state: "inProgress", path: null, reported: false, noted: false });
     });
     cdp.on("Browser.downloadProgress", (params) => {
       const p = params as Record<string, any>;
@@ -374,19 +436,28 @@ export class McpServer {
 
   private _finalize_download(entry: DownloadEntry): string {
     const from = join(this._downloads_dir, entry.guid);
-    const safe = basename(entry.suggestedFilename).replace(/[<>:"/\\|?*\x00-\x1f]/g, "_") || "download";
+    const safe = safe_filename(entry.suggestedFilename);
     const ext = extname(safe);
     const stem = safe.slice(0, safe.length - ext.length);
-    let to = join(this._downloads_dir, safe);
-    for (let n = 1; existsSync(to); n++) {
-      to = join(this._downloads_dir, `${stem} (${n})${ext}`);
+    // Reserve the name atomically ("wx"): several bots may share the folder and
+    // finish a same-named download at once; a check-then-rename would let one
+    // overwrite the other.
+    for (let n = 0; n < 1_000; n++) {
+      const to = join(this._downloads_dir, n === 0 ? safe : `${stem} (${n})${ext}`);
+      try {
+        closeSync(openSync(to, "wx"));
+      } catch {
+        continue;
+      }
+      try {
+        renameSync(from, to);
+        return to;
+      } catch {
+        rmSync(to, { force: true });
+        return from;
+      }
     }
-    try {
-      renameSync(from, to);
-      return to;
-    } catch {
-      return from;
-    }
+    return from;
   }
 
   // Per-tab hooks, installed once per page target: dialogs.
@@ -397,6 +468,13 @@ export class McpServer {
     this._wired.add(tab.target_id);
     this._seen_targets.add(tab.target_id);
     const policy = this._options.dialogPolicy ?? "accept";
+    // The page or a navigation can close a dialog on its own; a stale entry
+    // would make every tool refuse to act on this tab.
+    tab.cdp.on("Page.javascriptDialogClosed", (params) => {
+      if (!(params as Record<string, any>)?.sessionId) {
+        this._pending_dialogs.delete(tab.target_id);
+      }
+    });
     tab.onDialog(async (dialog) => {
       const id = this._tab_id_for(tab.target_id);
       const label = `${dialog.type} "${dialog.message.slice(0, 300)}"`;
@@ -410,10 +488,10 @@ export class McpServer {
       // beforeunload is always allowed through, or navigation would stall.
       if (policy === "accept" || dialog.type === "beforeunload") {
         await dialog.accept(dialog.type === "prompt" ? dialog.defaultPrompt : undefined);
-        this._notes.push(`Dialog on ${id} auto-accepted: ${label}`);
+        this._note(`Dialog on ${id} auto-accepted: ${label}`);
       } else {
         await dialog.dismiss();
-        this._notes.push(`Dialog on ${id} auto-dismissed: ${label}`);
+        this._note(`Dialog on ${id} auto-dismissed: ${label}`);
       }
     });
   }
@@ -431,7 +509,7 @@ export class McpServer {
 
   // Runs a page action; in manual dialog mode a dialog opened by the action
   // returns control right away instead of waiting on the frozen page.
-  private async _act(tab: Tab, action: () => Promise<void>): Promise<boolean> {
+  private async _act(tab: Tab, action: () => Promise<unknown>): Promise<boolean> {
     if ((this._options.dialogPolicy ?? "accept") !== "manual") {
       await action();
       return false;
@@ -441,7 +519,7 @@ export class McpServer {
       waiter = (target_id) => target_id === tab.target_id && resolve(true);
       this._dialog_waiters.add(waiter);
     });
-    const done = action().then(() => false);
+    const done = action().then((): boolean => false);
     void done.catch(() => undefined);
     try {
       return await Promise.race([done, opened]);
@@ -511,6 +589,7 @@ export class McpServer {
     }
     for (const [id, target] of this._tab_ids) {
       if (!alive.has(target)) {
+        this._forget_target(target);
         this._tab_ids.delete(id);
       }
     }
@@ -520,7 +599,15 @@ export class McpServer {
       .map((target) => ({ id: this._tab_id_for(String(target.id)), targetId: String(target.id), url: String(target.url ?? ""), title: String(target.title ?? "") }));
   }
 
-  private async _resolve_tab_id(id: string): Promise<{ id: string; targetId: string }> {
+  // Drops every per-target record of a page that no longer exists, including
+  // its CDP connection, so long sessions with many popups do not leak.
+  private _forget_target(target_id: string): void {
+    this._pending_dialogs.delete(target_id);
+    this._wired.delete(target_id);
+    void this._browser?.forgetTab(target_id);
+  }
+
+  private async _resolve_tab_id(id: string): Promise<{ id: string; targetId: string; url: string }> {
     const pages = await this._list_pages();
     const page = pages.find((entry) => entry.id === id.trim());
     if (!page) {
@@ -586,16 +673,27 @@ export class McpServer {
   private async _collect_notes(): Promise<string> {
     const notes = this._notes.splice(0);
     for (const download of this._downloads) {
-      if (download.state === "completed" && !download.reported) {
+      if (download.state === "completed" && !download.reported && !download.noted) {
+        download.noted = true;
         notes.push(`Download finished: ${download.path} (call wait_for_download to collect it).`);
       }
     }
     const fresh = (await this._list_pages().catch(() => [])).filter((page) => !this._seen_targets.has(page.targetId));
-    for (const page of fresh) {
-      this._seen_targets.add(page.targetId);
+    for (const page of fresh.slice(0, 5)) {
       notes.push(`The site opened a new tab ${page.id}: ${page.url || "(loading)"} — switch_tab to use it.`);
     }
-    return notes.map((note) => `Note: ${note}`).join("\n");
+    if (fresh.length > 5) {
+      notes.push(`The site opened ${fresh.length - 5} more tab(s) — call list_tabs.`);
+    }
+    for (const page of fresh) {
+      this._seen_targets.add(page.targetId);
+    }
+    if (notes.length === 0) {
+      return "";
+    }
+    // Dialog texts, popup URLs and file names come from the page: keep them
+    // inside the untrusted markers like any other page content.
+    return `Notes:\n${this._untrusted(notes.map((note) => `- ${note}`).join("\n"))}`;
   }
 
   // After an action: if it navigated outside the allowed domains, go back.
@@ -684,7 +782,7 @@ export class McpServer {
       // Fields that swallow the shortcut: set through the native setter so
       // React/Vue see the change.
       await element.callFunction({
-        fn: "function() { const proto = this instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype; const setter = Object.getOwnPropertyDescriptor(proto, 'value'); if ('value' in this && setter && setter.set) { setter.set.call(this, ''); } else { this.textContent = ''; } this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }",
+        fn: "function() { const proto = this instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : this instanceof HTMLInputElement ? HTMLInputElement.prototype : null; const setter = proto && Object.getOwnPropertyDescriptor(proto, 'value'); if (setter && setter.set) { setter.set.call(this, ''); } else if (this.isContentEditable) { this.textContent = ''; } else { throw new Error('not a text field'); } this.dispatchEvent(new Event('input', { bubbles: true })); this.dispatchEvent(new Event('change', { bubbles: true })); }",
       });
     }
   }
@@ -705,8 +803,8 @@ export class McpServer {
       on_chooser = (params) => resolve(Number(params.backendNodeId ?? 0));
     });
     tab.cdp.on("Page.fileChooserOpened", on_chooser!);
-    await tab.cdp.send("Page.setInterceptFileChooserDialog", { enabled: true }, session);
     try {
+      await tab.cdp.send("Page.setInterceptFileChooserDialog", { enabled: true }, session);
       await element.click();
       const backend_node_id = await Promise.race([chooser, delay(4_000).then(() => 0)]);
       if (backend_node_id) {
@@ -718,12 +816,18 @@ export class McpServer {
       await tab.cdp.send("Page.setInterceptFileChooserDialog", { enabled: false }, session).catch(() => undefined);
     }
 
-    const input = await tab.find({ selector: "input[type=file]", timeout: 1_000 });
+    // Fall back to the page's file input only when it is unambiguous: with
+    // several (CV, cover letter, photo) guessing would attach the wrong file.
+    const inputs = Number(await tab.evaluate({ expression: "document.querySelectorAll('input[type=file]').length" }).catch(() => 0));
+    if (inputs > 1) {
+      throw new Error(`Clicking ${ref} did not open a file chooser and the page has ${inputs} <input type=file>. Pass the ref of the right file input (snapshot shows them) instead.`);
+    }
+    const input = inputs === 1 ? await tab.find({ selector: "input[type=file]", timeout: 1_000 }) : null;
     if (!input) {
       throw new Error(`Clicking ${ref} did not open a file chooser and the page has no <input type=file>.`);
     }
     await input.setInputFiles({ files: paths });
-    return "first <input type=file> on the page";
+    return "the page's only <input type=file>";
   }
 
   private async _scroll(tab: Tab, args: Record<string, any>): Promise<string> {
@@ -762,10 +866,11 @@ export class McpServer {
     const step_size = (): number => Number(args.amount) || viewport[direction === "left" || direction === "right" ? 0 : 1] * (0.7 + Math.random() * 0.2);
     const sign = direction === "up" || direction === "left" ? -1 : 1;
     const horizontal = direction === "left" || direction === "right";
+    // [offset, content size, visible size] along the scroll axis.
     const position = async (): Promise<[number, number, number]> =>
       element
-        ? element.callFunction({ fn: "function() { return [this.scrollTop, this.scrollHeight, this.clientHeight]; }" })
-        : tab.evaluate({ expression: "[scrollY, document.documentElement.scrollHeight, innerHeight]" });
+        ? element.callFunction({ fn: horizontal ? "function() { return [this.scrollLeft, this.scrollWidth, this.clientWidth]; }" : "function() { return [this.scrollTop, this.scrollHeight, this.clientHeight]; }" })
+        : tab.evaluate({ expression: horizontal ? "[scrollX, document.documentElement.scrollWidth, innerWidth]" : "[scrollY, document.documentElement.scrollHeight, innerHeight]" });
     const count = async (): Promise<number> => (args.selector ? Number(await tab.evaluate({ expression: `document.querySelectorAll(${JSON.stringify(String(args.selector))}).length` })) : 0);
     const wheel = async (): Promise<void> => {
       await aim();
@@ -817,7 +922,15 @@ export class McpServer {
   }
 
   private async _wait_for(tab: Tab, args: Record<string, any>): Promise<number> {
-    const timeout = Math.min(120, Math.max(0, Number(args.timeout ?? 15))) * 1_000;
+    const timeout = wait_timeout_ms(args.timeout);
+    for (const selector of [args.selector, args.selectorGone]) {
+      if (selector !== undefined) {
+        const valid = await tab.evaluate({ expression: `(() => { try { document.createDocumentFragment().querySelector(${JSON.stringify(String(selector))}); return true; } catch { return false; } })()` });
+        if (valid === false) {
+          throw new Error(`Invalid CSS selector: ${String(selector)}`);
+        }
+      }
+    }
     const started = Date.now();
     const start_url = await tab.url();
     const checks: Array<[string, () => Promise<boolean>]> = [];
@@ -904,6 +1017,56 @@ export class McpServer {
     }
   }
 
+  // Domains export_session may write. With --allowed-domains the export is
+  // limited to them (an unscoped export would leak every site's cookies of the
+  // profile, e.g. the bot's Google login, to a file).
+  private _session_domains(requested: unknown): string[] {
+    const domains = (Array.isArray(requested) ? requested : requested === undefined || requested === null ? [] : [requested])
+      .map((domain) => String(domain).trim())
+      .filter(Boolean);
+    const allowed = this._options.allowedDomains ?? [];
+    if (allowed.length === 0) {
+      return domains;
+    }
+    if (domains.length === 0) {
+      return [...allowed];
+    }
+    const outside = domains.filter((domain) => !allowed.some((entry) => host_matches(domain.replace(/^\*?\./, ""), entry)));
+    if (outside.length > 0) {
+      throw new Error(`Cannot export ${outside.join(", ")}: not in the allowed domains (${allowed.join(", ")}).`);
+    }
+    return domains;
+  }
+
+  // export_session target: an absolute *.json path whose folder exists, and
+  // never an existing file that is not an earlier export (the agent must not be
+  // able to overwrite arbitrary files with it).
+  private _session_path(value: unknown): string {
+    const raw = String(value ?? "");
+    if (!raw || !isAbsolute(raw)) {
+      throw new Error(`path must be an absolute file path (got "${raw}").`);
+    }
+    const path = resolve_path(raw);
+    if (extname(path).toLowerCase() !== ".json") {
+      throw new Error("path must end in .json.");
+    }
+    if (!existsSync(dirname(path)) || !statSync(dirname(path)).isDirectory()) {
+      throw new Error(`Folder does not exist: ${dirname(path)}`);
+    }
+    if (existsSync(path)) {
+      let previous: any = null;
+      try {
+        previous = statSync(path).isFile() && statSync(path).size <= MAX_SESSION_FILE_BYTES ? JSON.parse(readFileSync(path, "utf8")) : null;
+      } catch {
+        previous = null;
+      }
+      if (!previous || previous.version !== 1 || !Array.isArray(previous.cookies)) {
+        throw new Error(`Refusing to overwrite ${path}: it exists and is not a session file written by export_session.`);
+      }
+    }
+    return path;
+  }
+
   // ---------- tools ----------
 
   private _define_tools(): ToolDef[] {
@@ -927,7 +1090,14 @@ export class McpServer {
         run: async (args) => {
           this._check_url(String(args.url));
           const tab = await this._get_tab();
-          await tab.goto({ url: String(args.url), waitUntil: args.waitUntil ?? "load", timeout: 45_000 });
+          if (this._pending_dialogs.has(tab.target_id)) {
+            await this._ready_tab();
+          }
+          // A beforeunload dialog (manual mode) returns control instead of
+          // stalling the navigation until its timeout.
+          if (await this._act(tab, () => tab.goto({ url: String(args.url), waitUntil: args.waitUntil ?? "load", timeout: 45_000 }))) {
+            return text(await this._page_state(tab));
+          }
           await this._enforce_location(tab);
           return text(await this._page_state(tab));
         },
@@ -986,6 +1156,10 @@ export class McpServer {
         inputSchema: { type: "object", properties: { id: { type: "string", description: "Tab id from list_tabs, e.g. \"t2\"." } }, required: ["id"] },
         run: async (args) => {
           const page = await this._resolve_tab_id(String(args.id));
+          if ((this._options.allowedDomains ?? []).length && /^https?:/i.test(page.url)) {
+            // A popup the site opened may sit on any domain.
+            this._check_url(page.url);
+          }
           const tab = await this._activate(page.targetId);
           return text(await this._page_state(tab));
         },
@@ -1002,6 +1176,9 @@ export class McpServer {
             throw new Error("No tabs open yet.");
           }
           let page: { id: string; targetId: string };
+          if (!browser.launched) {
+            throw new Error("No tabs open yet.");
+          }
           if (args.id) {
             page = await this._resolve_tab_id(String(args.id));
           } else {
@@ -1012,6 +1189,7 @@ export class McpServer {
           const was_current = this._tab?.target_id === page.targetId;
           await browser.closeTab(tab);
           this._tab_ids.delete(page.id);
+          this._forget_target(page.targetId);
           if (!was_current) {
             return text(`Closed ${page.id}. Current tab unchanged.`);
           }
@@ -1114,7 +1292,9 @@ export class McpServer {
         inputSchema: { type: "object", properties: {} },
         run: async () => {
           const tab = await this._ready_tab();
-          await tab.forward();
+          if (await this._act(tab, () => tab.forward())) {
+            return text(await this._page_state(tab));
+          }
           await this._enforce_location(tab);
           return text(await this._page_state(tab));
         },
@@ -1137,7 +1317,10 @@ export class McpServer {
         inputSchema: { type: "object", properties: {} },
         run: async () => {
           const tab = await this._ready_tab();
-          await tab.back();
+          if (await this._act(tab, () => tab.back())) {
+            return text(await this._page_state(tab));
+          }
+          await this._enforce_location(tab);
           return text(await this._page_state(tab));
         },
       },
@@ -1239,6 +1422,11 @@ export class McpServer {
         annotations: { readOnlyHint: true, openWorldHint: true },
         run: async (args) => {
           this._check_url(String(args.url));
+          // Launch through the server so its startup page and downloads are set
+          // up; scrape() would otherwise launch the shared browser behind its back.
+          if ((args.strategy ?? "auto") !== "http") {
+            await this._launched_browser();
+          }
           const result = await scrape({
             url: String(args.url),
             formats: (args.formats ?? ["markdown"]) as ScrapeFormat[],
@@ -1246,6 +1434,14 @@ export class McpServer {
             browser: this._ensure_browser(),
             markdown: args.query ? { query: String(args.query) } : undefined,
           });
+          if ((this._options.allowedDomains ?? []).length && result.url) {
+            // A redirect may have landed outside the allowed domains.
+            try {
+              this._check_url(result.url);
+            } catch (error) {
+              throw new Error(`${String((error as Error).message)} The URL redirected there; the content was discarded.`);
+            }
+          }
           const parts = [`URL: ${result.url}`, `Tier: ${result.tier}`, `Title: ${result.title}`];
           if (result.markdown !== undefined) {
             parts.push(`\n${this._untrusted(result.markdown)}`);
@@ -1275,6 +1471,7 @@ export class McpServer {
           await element.scrollIntoView();
           await element.hover();
           await tab.sleep({ milliseconds: 500 });
+          await this._enforce_location(tab);
           return text(await this._page_state(tab));
         },
       },
@@ -1293,6 +1490,7 @@ export class McpServer {
             throw new Error("Give label or value.");
           }
           const chosen = await this._select_option(tab, String(args.ref), args.label !== undefined ? String(args.label) : undefined, args.value !== undefined ? String(args.value) : undefined);
+          await this._enforce_location(tab);
           return text(`Selected: ${chosen}\n\n${await this._page_state(tab)}`);
         },
       },
@@ -1303,6 +1501,7 @@ export class McpServer {
         run: async (args) => {
           const tab = await this._ready_tab();
           const state = await this._set_checked(tab, String(args.ref), args.checked ?? true);
+          await this._enforce_location(tab);
           return text(`checked: ${state}\n\n${await this._page_state(tab)}`);
         },
       },
@@ -1364,14 +1563,17 @@ export class McpServer {
             }
             await tab.sleep({ milliseconds: 250 });
           }
+          if (args.submit && !last_text) {
+            done.push("submit ignored: no text field to press Enter in — click the submit button instead.");
+          }
           if (args.submit && last_text) {
             const submit_element = last_text;
             if (await this._act(tab, () => submit_element.pressKey({ key: "Enter" }))) {
               return text(`${done.join("\n")}\n\n${await this._page_state(tab)}`);
             }
             await tab.sleep({ milliseconds: 800 });
-            await this._enforce_location(tab);
           }
+          await this._enforce_location(tab);
           return text(`${done.join("\n")}\n\n${await this._page_state(tab)}`);
         },
       },
@@ -1386,7 +1588,15 @@ export class McpServer {
         },
         run: async (args) => {
           const tab = await this._ready_tab();
-          const paths = (Array.isArray(args.paths) ? args.paths : [args.paths]).map((path: unknown) => resolve_path(String(path)));
+          const raw: string[] = (Array.isArray(args.paths) ? args.paths : [args.paths]).filter((path: unknown) => path !== undefined && path !== null).map(String);
+          if (raw.length === 0) {
+            throw new Error("paths is empty.");
+          }
+          const relative = raw.find((path) => !isAbsolute(path));
+          if (relative !== undefined) {
+            throw new Error(`Paths must be absolute (got "${relative}").`);
+          }
+          const paths = raw.map((path) => resolve_path(path));
           for (const path of paths) {
             if (!existsSync(path) || !statSync(path).isFile()) {
               throw new Error(`File not found: ${path}`);
@@ -1394,6 +1604,7 @@ export class McpServer {
           }
           const how = await this._upload(tab, String(args.ref), paths);
           await tab.sleep({ milliseconds: 500 });
+          await this._enforce_location(tab);
           return text(`Attached ${paths.map((path) => basename(path)).join(", ")} (${how}).\n\n${await this._page_state(tab)}`);
         },
       },
@@ -1458,6 +1669,8 @@ export class McpServer {
         run: async (args) => {
           const tab = await this._ready_tab();
           const value = await tab.evaluate({ expression: String(args.expression), world: args.world === "main" ? "main" : "isolated" });
+          // The expression may have navigated (location.href = …).
+          await this._enforce_location(tab);
           return text(this._untrusted(value === undefined ? "undefined" : JSON.stringify(value, null, 2)));
         },
       },
@@ -1478,6 +1691,7 @@ export class McpServer {
           }
           await this._paste(tab, value, session);
           await tab.sleep({ milliseconds: 300 });
+          await this._enforce_location(tab);
           return text(await this._page_state(tab));
         },
       },
@@ -1492,14 +1706,26 @@ export class McpServer {
           if (!pending) {
             throw new Error("No dialog is open on the current tab.");
           }
+          const prompt_text = args.promptText !== undefined ? this._fill_secrets(String(args.promptText)) : undefined;
           this._pending_dialogs.delete(tab.target_id);
-          if (args.accept ?? true) {
-            await pending.dialog.accept(args.promptText !== undefined ? this._fill_secrets(String(args.promptText)) : pending.type === "prompt" ? pending.defaultPrompt : undefined);
-          } else {
-            await pending.dialog.dismiss();
+          let gone = false;
+          try {
+            if (args.accept ?? true) {
+              await pending.dialog.accept(prompt_text ?? (pending.type === "prompt" ? pending.defaultPrompt : undefined));
+            } else {
+              await pending.dialog.dismiss();
+            }
+          } catch (error) {
+            // The page already closed it (navigation, timeout): nothing to answer.
+            if (!/no dialog/i.test(String((error as Error)?.message ?? error))) {
+              throw error;
+            }
+            gone = true;
           }
           await tab.sleep({ milliseconds: 500 });
-          return text(`${args.accept ?? true ? "Accepted" : "Dismissed"} ${pending.type} "${pending.message}".\n\n${await this._page_state(tab)}`);
+          await this._enforce_location(tab);
+          const verb = gone ? "The dialog had already closed:" : args.accept ?? true ? "Accepted" : "Dismissed";
+          return text(`${verb} ${pending.type} ${this._untrusted(pending.message)}\n\n${await this._page_state(tab)}`);
         },
       },
       {
@@ -1511,6 +1737,9 @@ export class McpServer {
           const timeout = Math.min(600, Math.max(1, Number(args.timeout) || 60)) * 1_000;
           if (!this._browser_cdp) {
             await this._launched_browser();
+          }
+          if (!this._browser_cdp) {
+            throw new Error(`Downloads are unavailable in this browser session${this._downloads_error ? `: ${this._downloads_error}` : ""}.`);
           }
           const deadline = Date.now() + timeout;
           while (Date.now() < deadline) {
@@ -1561,8 +1790,9 @@ export class McpServer {
           required: ["path"],
         },
         run: async (args) => {
+          const domains = this._session_domains(args.domains);
+          const path = this._session_path(args.path);
           const tab = await this._get_tab();
-          const domains: string[] = Array.isArray(args.domains) ? args.domains.map(String) : [];
           const keep = (host: string): boolean => domains.length === 0 || domains.some((domain) => host_matches(host.replace(/^\./, ""), domain));
           const all = (await tab.cdp.send("Network.getAllCookies")).cookies ?? [];
           const cookies = all.filter((cookie: Record<string, any>) => keep(String(cookie.domain)));
@@ -1582,33 +1812,49 @@ export class McpServer {
               origins[origin] = { localStorage: items };
             }
           }
-          const path = resolve_path(String(args.path));
-          writeFileSync(path, JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), cookies, origins }, null, 2), { mode: 0o600 });
-          return text(`Saved ${cookies.length} cookies and localStorage of ${Object.keys(origins).length} origin(s) to ${path}. Treat this file like a password.`);
+          // Write a sibling temp file and rename it over the target: a crash
+          // mid-write never leaves a truncated session, and the 0600 mode
+          // applies even when replacing an older export.
+          const temp = `${path}.${process.pid}.tmp`;
+          writeFileSync(temp, JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), cookies, origins }, null, 2), { mode: 0o600 });
+          try {
+            chmodSync(temp, 0o600);
+            renameSync(temp, path);
+          } catch (error) {
+            rmSync(temp, { force: true });
+            throw error;
+          }
+          return text(`Saved ${cookies.length} cookies and localStorage of ${Object.keys(origins).length} origin(s) to ${path}${domains.length ? ` (domains: ${domains.join(", ")})` : ""}. Treat this file like a password.`);
         },
       },
       {
         name: "import_session",
         description: "Restore a session saved by export_session (cookies + localStorage) into this browser profile. Then navigate to the site.",
-        inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+        inputSchema: { type: "object", properties: { path: { type: "string", description: "Absolute path of a file written by export_session." } }, required: ["path"] },
         run: async (args) => {
+          const data = read_session_file(String(args.path ?? ""));
+          const allowed = this._options.allowedDomains ?? [];
+          const in_scope = (host: string): boolean => allowed.length === 0 || allowed.some((domain) => host_matches(host.replace(/^\./, ""), domain));
+          let skipped = 0;
+          const cookies = data.cookies
+            .filter((cookie) => in_scope(String(cookie.domain)) || (skipped++, false))
+            .map((cookie) => {
+              const { size: _size, session, ...rest } = cookie;
+              return session || rest.expires === -1 ? { ...rest, expires: undefined } : rest;
+            });
+          const storage = Object.entries(data.origins).filter(([origin]) => in_scope(new URL(origin).hostname) || (skipped++, false));
           const tab = await this._get_tab();
-          const data = JSON.parse(readFileSync(resolve_path(String(args.path)), "utf8"));
-          const cookies = (Array.isArray(data.cookies) ? data.cookies : []).map((cookie: Record<string, any>) => {
-            const { size: _size, session, ...rest } = cookie;
-            return session || rest.expires === -1 ? { ...rest, expires: undefined } : rest;
-          });
           if (cookies.length > 0) {
             await tab.cdp.send("Network.setCookies", { cookies });
           }
           let items = 0;
-          for (const [origin, entry] of Object.entries((data.origins ?? {}) as Record<string, { localStorage?: Record<string, string> }>)) {
+          for (const [origin, entry] of storage) {
             for (const [key, value] of Object.entries(entry.localStorage ?? {})) {
               await tab.cdp.send("DOMStorage.setDOMStorageItem", { storageId: { securityOrigin: origin, isLocalStorage: true }, key, value: String(value) });
               items++;
             }
           }
-          return text(`Restored ${cookies.length} cookies and ${items} localStorage item(s).`);
+          return text(`Restored ${cookies.length} cookies and ${items} localStorage item(s).${skipped ? ` Skipped ${skipped} cookie(s)/origin(s) outside the allowed domains.` : ""}`);
         },
       },
       {
@@ -1628,8 +1874,8 @@ export class McpServer {
         inputSchema: { type: "object", properties: {} },
         annotations: { readOnlyHint: true, openWorldHint: true },
         run: async () => {
-          this._ensure_browser();
-          return text(JSON.stringify(await this._ensure_browser().checkEgress(), null, 2));
+          const browser = await this._launched_browser();
+          return text(this._untrusted(JSON.stringify(await browser.checkEgress(), null, 2)));
         },
       },
     ];
@@ -1655,4 +1901,83 @@ export function find_option(snapshot: string, want: string): { ref: string; name
     }
   }
   return options.find((option) => norm(option.name) === target) ?? options.find((option) => norm(option.name).includes(target)) ?? null;
+}
+
+// Download names come from the site: keep only a plain file name that Windows
+// and POSIX can both create (no separators, no reserved device names such as
+// CON or NUL, no trailing dots/spaces, bounded length).
+export function safe_filename(name: string): string {
+  let safe = basename(String(name).replace(/\\/g, "/"))
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+    .replace(/[. ]+$/, "")
+    .trim();
+  if (!safe || /^\.+$/.test(safe)) {
+    safe = "download";
+  }
+  if (/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\..*)?$/i.test(safe)) {
+    safe = `_${safe}`;
+  }
+  if (safe.length > 180) {
+    const ext = extname(safe).slice(0, 20);
+    safe = safe.slice(0, 180 - ext.length) + ext;
+  }
+  return safe;
+}
+
+type SessionCookie = Record<string, any> & { name: string; value: string; domain: string };
+type SessionFile = { cookies: SessionCookie[]; origins: Record<string, { localStorage?: Record<string, string> }> };
+
+// Reads and validates a file written by export_session; every malformed input
+// becomes a clear error instead of a TypeError or a raw CDP failure.
+export function read_session_file(raw_path: string): SessionFile {
+  if (!raw_path || !isAbsolute(raw_path)) {
+    throw new Error(`path must be an absolute file path (got "${raw_path}").`);
+  }
+  const path = resolve_path(raw_path);
+  if (!existsSync(path) || !statSync(path).isFile()) {
+    throw new Error(`File not found: ${path}`);
+  }
+  if (statSync(path).size > MAX_SESSION_FILE_BYTES) {
+    throw new Error(`${path} is larger than ${MAX_SESSION_FILE_BYTES / 1024 / 1024} MB — not a session export.`);
+  }
+  let data: any;
+  try {
+    data = JSON.parse(readFileSync(path, "utf8").replace(/^\uFEFF/, ""));
+  } catch (error) {
+    throw new Error(`${path} is not valid JSON: ${String((error as Error).message)}`);
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data) || data.version !== 1 || !Array.isArray(data.cookies)) {
+    throw new Error(`${path} is not a session file written by export_session (expected {version: 1, cookies: [...], origins: {...}}).`);
+  }
+  data.cookies.forEach((cookie: any, index: number) => {
+    if (!cookie || typeof cookie !== "object" || typeof cookie.name !== "string" || typeof cookie.value !== "string" || typeof cookie.domain !== "string" || !cookie.domain) {
+      throw new Error(`${path}: cookie #${index + 1} needs string name, value and domain.`);
+    }
+  });
+  const origins = data.origins ?? {};
+  if (typeof origins !== "object" || Array.isArray(origins)) {
+    throw new Error(`${path}: origins must be an object.`);
+  }
+  for (const [origin, entry] of Object.entries(origins as Record<string, any>)) {
+    let parsed: URL;
+    try {
+      parsed = new URL(origin);
+    } catch {
+      throw new Error(`${path}: invalid origin ${origin}.`);
+    }
+    if (!/^https?:$/.test(parsed.protocol) || parsed.origin !== origin) {
+      throw new Error(`${path}: origin ${origin} must be an http(s) origin like https://example.com.`);
+    }
+    if (!entry || typeof entry !== "object" || (entry.localStorage !== undefined && (typeof entry.localStorage !== "object" || Array.isArray(entry.localStorage)))) {
+      throw new Error(`${path}: origins["${origin}"].localStorage must be an object.`);
+    }
+  }
+  return { cookies: data.cookies, origins };
+}
+
+// wait_for timeout in ms: default 15 s, clamped to 0–120 s. A non-numeric value
+// falls back to the default (NaN would make the deadline check never true).
+export function wait_timeout_ms(value: unknown): number {
+  const requested = Number(value ?? 15);
+  return Math.min(120, Math.max(0, Number.isFinite(requested) ? requested : 15)) * 1_000;
 }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, before, describe, test } from "node:test";
 
 import { Browser, BrowserError, findChrome, profileInUse } from "../../src/index";
@@ -233,6 +233,89 @@ describe("mcp bot tools over stdio (e2e)", { skip: chrome ? false : "Chrome not 
     assert.equal(out.isError, false, out.text);
     assert.match(out.text, /relaunched on the same profile/);
     assert.match(out.text, /Page: Products/);
+  });
+});
+
+describe("mcp red team over stdio (e2e)", { skip: chrome ? false : "Chrome not found" }, () => {
+  let server: FixtureServer;
+  let client: Client;
+  let profile: string;
+  let work: string;
+
+  before(async () => {
+    server = await startFixtureServer();
+    profile = mkdtempSync(join(tmpdir(), "bs-red-profile-"));
+    work = mkdtempSync(join(tmpdir(), "bs-red-work-"));
+    client = await start_client(["--user-data-dir", profile, "--allowed-domains", "127.0.0.1", "--downloads-dir", join(work, "downloads")]);
+  });
+
+  after(async () => {
+    await client?.stop();
+    await server?.close();
+    rmSync(work, { recursive: true, force: true });
+    rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
+  });
+
+  test("hostile page: dialog spam, popup storm, ambiguous uploads, traversal downloads, escapes", async () => {
+    const { tool } = client;
+    let page = (await tool("navigate", { url: `${server.origin}/hostile` })).text;
+
+    // 60 alerts are auto-accepted and reported as a bounded, untrusted notes block.
+    let out = await tool("click", { ref: ref(page, /button "Spam alerts" \[ref=(e\d+)\]/) });
+    assert.equal(out.isError, false, out.text);
+    assert.match(out.text, /spam done/);
+    const note_lines = out.text.split("\n").filter((line) => /^- Dialog on t\d+ auto-accepted/.test(line));
+    assert.ok(note_lines.length <= 20, `${note_lines.length} note lines`);
+    assert.match(out.text, /earlier note\(s\) dropped/);
+    assert.match(out.text, /Notes:\n<untrusted-page-content>[\s\S]*spam 59/);
+
+    // window.open storm: summarized, every tab still listed.
+    out = await tool("click", { ref: ref(out.text, /button "Open many" \[ref=(e\d+)\]/) });
+    // (Chrome's popup blocker lets one window.open per click through; the
+    // storm summary itself is covered by the unit tests.)
+    assert.match(out.text, /Notes:\n<untrusted-page-content>\n- The site opened a new tab t2/);
+
+    // upload through a button that opens no chooser, with two file inputs: refuse to guess.
+    const cv = join(work, "cv.pdf");
+    writeFileSync(cv, "%PDF");
+    page = (await tool("snapshot")).text;
+    out = await tool("upload_file", { ref: ref(page, /button "Attach" \[ref=(e\d+)\]/), paths: [cv] });
+    assert.equal(out.isError, true);
+    assert.match(out.text, /has 2 <input type=file>/);
+    out = await tool("upload_file", { ref: ref(page, /button "Attach" \[ref=(e\d+)\]/), paths: ["cv.pdf"] });
+    assert.match(out.text, /must be absolute/);
+
+    // a download named ../../evil.txt stays inside the downloads folder.
+    await tool("click", { ref: ref(page, /link "Evil download" \[ref=(e\d+)\]/) });
+    out = await tool("wait_for_download", { timeout: 20 });
+    assert.equal(out.isError, false, out.text);
+    const file = out.text.match(/Downloaded: (.+)/)?.[1].trim() ?? "";
+    assert.equal(dirname(file), join(work, "downloads"));
+    assert.equal(readFileSync(file, "utf8"), "evil\n");
+
+    // evaluate cannot be used to escape the allowed domains.
+    out = await tool("evaluate", { expression: `location.href = ${JSON.stringify(`${server.crossOrigin}/products`)}; 1` });
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    out = await tool("evaluate", { expression: "location.host" });
+    assert.doesNotMatch(out.text, /localhost/);
+
+    // wait_for: bad selector fails fast; non-numeric timeout does not hang.
+    out = await tool("wait_for", { selector: "div[[", timeout: 30 });
+    assert.match(out.text, /Invalid CSS selector/);
+
+    // export_session is scoped to the allowed domains and never overwrites other files.
+    const other = join(work, "notes.json");
+    writeFileSync(other, "{\"keep\":true}");
+    out = await tool("export_session", { path: other });
+    assert.match(out.text, /Refusing to overwrite/);
+    assert.equal(readFileSync(other, "utf8"), "{\"keep\":true}");
+    out = await tool("export_session", { path: join(work, "s.json"), domains: ["google.com"] });
+    assert.match(out.text, /not in the allowed domains/);
+    out = await tool("export_session", { path: join(work, "s.json") });
+    assert.match(out.text, /domains: 127\.0\.0\.1/);
+    writeFileSync(join(work, "bad.json"), "null");
+    out = await tool("import_session", { path: join(work, "bad.json") });
+    assert.match(out.text, /not a session file/);
   });
 });
 

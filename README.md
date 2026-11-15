@@ -240,12 +240,13 @@ Or in any MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, â
 | `handle_dialog` | Answers alert/confirm/prompt when running with `--dialogs manual` |
 | `wait_for_download` | Waits for a download and returns the saved file path (`--downloads-dir`) |
 | `tab_info` / `reload` / `go_forward` | Cheap state check; reload; history forward |
-| `export_session` / `import_session` | Backs up / restores cookies + localStorage to a JSON file (values never returned to the model) |
-| `close_browser` | Closes Chrome gracefully (cookies flushed). The next call relaunches on the same profile, which also happens automatically if Chrome crashed or the user closed it |
+| `export_session` / `import_session` | Backs up / restores cookies + localStorage to an absolute `*.json` path (values never returned to the model). With `--allowed-domains` only those domains are exported/imported; an existing file that is not an earlier export is never overwritten |
+| `close_browser` | Closes Chrome gracefully (cookies flushed). The next call relaunches on the same profile, which also happens automatically if Chrome crashed or the user closed it (read-only calls and `navigate` are retried; page actions such as `click` report the relaunch instead of being repeated on a blank page) |
 
 **Guard rails:**
 
-- `--allowed-domains a.com,b.com` refuses navigation elsewhere, and rolls back clicks that leave the list.
+- `--allowed-domains a.com,b.com` refuses navigation elsewhere, rolls back any action (click, key, form, `evaluate`, history) that leaves the list, refuses `switch_tab` to a popup outside it, and discards `scrape` results that redirected outside it.
+- Every tool call is bounded (180 s; longer for `scroll`, `scrape`, `wait_for_download`), so a frozen page cannot block the bot forever. Notes (auto-answered dialogs, popups, downloads) are capped and returned inside the untrusted markers.
 - `--secrets .env` lets the agent type `{{PASSWORD}}`. The value is filled in at keystroke time and redacted from everything returned.
 - `--dialogs accept|dismiss|manual` decides how JS dialogs are answered (default `accept`; every auto-answer is reported). In `manual` mode the action returns as soon as a dialog opens and the agent answers it with `handle_dialog`; nothing hangs.
 - `--downloads-dir <dir>` is where `wait_for_download` finds files (saved under the site's file name).

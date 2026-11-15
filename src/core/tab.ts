@@ -53,6 +53,9 @@ export type TabStealth = {
   screenCoordOffset?: { x: number; y: number } | null;
 };
 
+// A request in flight longer than this no longer blocks "network idle".
+const INFLIGHT_STALE_MS = 15_000;
+
 export class Tab {
   ws_url: string;
   target_info: Record<string, any>;
@@ -71,7 +74,9 @@ export class Tab {
   private _oop_frame_sessions = new Map<string, string>();
   private _snapshot_refs = new Map<string, SnapshotRef>();
   // In-flight network requests of this page, for waitForNetworkIdle().
-  private _inflight = new Set<string>();
+  // requestId -> start time. Requests older than INFLIGHT_STALE_MS stop
+  // counting (long-polls, websockets, requests that never get a response).
+  private _inflight = new Map<string, number>();
   private _last_network_activity = Date.now();
   private _network: Network | null = null;
   private _proxy_auth: [string, string] | null;
@@ -131,17 +136,15 @@ export class Tab {
       this._last_network_activity = Date.now();
     };
     this._cdp.on("Network.requestWillBeSent", (params) => {
-      this._inflight.add(String((params as Record<string, any>).requestId));
+      const id = String((params as Record<string, any>).requestId);
+      // A redirect re-uses the requestId: keep the original start time.
+      if (!this._inflight.has(id)) {
+        this._inflight.set(id, Date.now());
+      }
       this._last_network_activity = Date.now();
     });
     this._cdp.on("Network.loadingFinished", (params) => settle(params as Record<string, any>));
     this._cdp.on("Network.loadingFailed", (params) => settle(params as Record<string, any>));
-    // A long-poll/websocket that never finishes must not block "idle" forever:
-    // requests older than 15 s stop counting.
-    this._cdp.on("Network.responseReceived", (params) => {
-      const id = String((params as Record<string, any>).requestId);
-      setTimeout(() => this._inflight.delete(id), 15_000).unref?.();
-    });
 
     this._cdp.on("Page.frameNavigated", (params) => {
       this._on_frame_navigated(params as Record<string, any>);
@@ -749,7 +752,7 @@ export class Tab {
     const deadline = Date.now() + timeout;
     let quiet_since = 0;
     while (Date.now() < deadline) {
-      if (this._inflight.size <= maxInflight) {
+      if (this._active_requests() <= maxInflight) {
         quiet_since = quiet_since || Math.max(Date.now() - 100, maxInflight === 0 ? this._last_network_activity : 0);
         if (Date.now() - quiet_since >= idleMs) {
           return;
@@ -759,7 +762,19 @@ export class Tab {
       }
       await delay(100);
     }
-    throw new Error(`Timeout waiting for network idle (${this._inflight.size} requests still in flight)`);
+    throw new Error(`Timeout waiting for network idle (${this._active_requests()} requests still in flight)`);
+  }
+
+  // In-flight requests younger than INFLIGHT_STALE_MS; older entries are
+  // dropped so the map cannot grow without bound on a long-lived page.
+  private _active_requests(): number {
+    const cutoff = Date.now() - INFLIGHT_STALE_MS;
+    for (const [id, started] of this._inflight) {
+      if (started < cutoff) {
+        this._inflight.delete(id);
+      }
+    }
+    return this._inflight.size;
   }
 
   // Raw CDP client of this page, for advanced callers (downloads, DOMStorage…).
