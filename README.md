@@ -250,7 +250,7 @@ Or in any MCP client config (`claude_desktop_config.json`, `.cursor/mcp.json`, â
 - `--secrets .env` lets the agent type `{{PASSWORD}}`. The value is filled in at keystroke time and redacted from everything returned.
 - `--dialogs accept|dismiss|manual` decides how JS dialogs are answered (default `accept`; every auto-answer is reported). In `manual` mode the action returns as soon as a dialog opens and the agent answers it with `handle_dialog`; nothing hangs.
 - `--downloads-dir <dir>` is where `wait_for_download` finds files (saved under the site's file name).
-- With `--user-data-dir`, a second Chrome on the same profile fails fast with a clear "already in use" error instead of a launch timeout.
+- With `--user-data-dir`, a second Chrome on the same profile fails fast with a clear "already in use" error instead of a launch timeout. A Chrome left behind by a server that was hard-killed (e.g. `taskkill /F`) is detected through `browser-scraper.owner.json` in the profile and closed by the next start; a Chrome whose server is still running is never touched.
 - Page content always comes back inside `<untrusted-page-content>` markers.
 - Other options: `--proxy`, `--headful`, `--user-data-dir`, `--geo BR`. The server is also listed for the MCP Registry (`server.json`), and an [Agent Skill](./skills/browser-scraper/SKILL.md) is included.
 

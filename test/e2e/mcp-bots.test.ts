@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, before, describe, test } from "node:test";
 
-import { Browser, BrowserError, findChrome, profileInUse } from "../../src/index";
+import { Browser, BrowserError, findChrome, findOrphanChrome, OWNER_FILE, profileInUse } from "../../src/index";
 import { startFixtureServer, type FixtureServer } from "../fixtures/server";
 
 // Drives the MCP server as a real client would: a child process over stdio,
@@ -343,6 +343,111 @@ describe("mcp red team over stdio (e2e)", { skip: chrome ? false : "Chrome not f
 
 // Main Chrome process for a profile: the one whose command line has the
 // user-data-dir and no --type= (helpers carry --type=renderer/gpu/…).
+describe("mcp server hard-killed (e2e)", { skip: chrome ? false : "Chrome not found" }, () => {
+  test("launch installs the exit guard and owner sidecar; close removes both", async () => {
+    const profile = mkdtempSync(join(tmpdir(), "bs-guard-profile-"));
+    const browser = new Browser({ chromePath: chrome, headless: true, userDataDir: profile, warnOnDirectEgress: false });
+    const before_count = process.listenerCount("exit");
+    try {
+      await browser.launch();
+      assert.equal(process.listenerCount("exit"), before_count + 1);
+      const owner = JSON.parse(readFileSync(join(profile, OWNER_FILE), "utf8"));
+      assert.equal(owner.ownerPid, process.pid);
+      assert.equal(owner.chromePid, await find_chrome_pid(profile));
+      // our own live Chrome is never treated as an orphan
+      assert.equal(findOrphanChrome(profile), null);
+    } finally {
+      await browser.close();
+    }
+    assert.equal(process.listenerCount("exit"), before_count);
+    assert.equal(existsSync(join(profile, OWNER_FILE)), false);
+    rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  });
+
+  test("hard-killing the server (taskkill /F) never leaves the profile unusable", async () => {
+    const server = await startFixtureServer();
+    const profile = mkdtempSync(join(tmpdir(), "bs-hardkill-profile-"));
+    let second: Client | null = null;
+    try {
+      const first = await start_client(["--user-data-dir", profile, "--allowed-domains", "127.0.0.1"]);
+      let out = await first.tool("navigate", { url: `${server.origin}/products` });
+      assert.equal(out.isError, false, out.text);
+      const old_chrome = await find_chrome_pid(profile);
+      assert.ok(old_chrome, "chrome pid for profile");
+      // Hard kill ONLY the node process (TerminateProcess / SIGKILL): no JS handler runs.
+      const exited = new Promise((resolve) => first.child.on("exit", resolve));
+      if (process.platform === "win32") {
+        spawnSync("taskkill", ["/PID", String(first.child.pid), "/F"], { stdio: "ignore" });
+      } else {
+        first.child.kill("SIGKILL");
+      }
+      await exited;
+      second = await start_client(["--user-data-dir", profile, "--allowed-domains", "127.0.0.1"]);
+      out = await second.tool("navigate", { url: `${server.origin}/products` });
+      assert.equal(out.isError, false, out.text);
+      assert.match(out.text, /Page: Products/);
+      const now = await find_chrome_pid(profile);
+      assert.ok(now && now !== old_chrome, "a fresh Chrome serves the new server");
+      assert.throws(() => process.kill(old_chrome, 0), "the old Chrome is gone");
+    } finally {
+      await second?.stop();
+      await server.close();
+      rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    }
+  });
+
+  test("a new server reclaims a Chrome orphaned on its profile, but never one whose owner is alive", async () => {
+    const server = await startFixtureServer();
+    const profile = mkdtempSync(join(tmpdir(), "bs-orphan-profile-"));
+    const arg = `--user-data-dir=${profile}`;
+    let client: Client | null = null;
+    // A detached Chrome (outside any job object, like one left by a server killed
+    // from outside its process tree) holding the profile, with a sidecar naming
+    // an owner that has exited.
+    const orphan = spawn(chrome as string, ["--headless=new", "--no-first-run", "--no-default-browser-check", arg, "about:blank"], { detached: true, stdio: "ignore", windowsHide: true });
+    orphan.unref();
+    try {
+      for (let i = 0; i < 50 && !profileInUse(profile); i++) {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      assert.ok(profileInUse(profile), "orphan holds the profile");
+      const orphan_pid = orphan.pid as number;
+
+      // 1) owner alive (this test process) -> the new server must refuse and leave that Chrome alone
+      writeFileSync(join(profile, OWNER_FILE), JSON.stringify({ ownerPid: process.pid, ownerStartedAt: Math.round(Date.now() - process.uptime() * 1000), chromePid: orphan_pid, userDataDirArg: arg }));
+      client = await start_client(["--user-data-dir", profile, "--allowed-domains", "127.0.0.1"]);
+      let out = await client.tool("navigate", { url: `${server.origin}/products` });
+      assert.equal(out.isError, true, out.text);
+      assert.match(out.text, /already in use by another Chrome/);
+      process.kill(orphan_pid, 0); // still alive
+      await client.stop();
+      client = null;
+
+      // 2) owner dead -> the new server kills the orphan tree and launches
+      const dead = spawnSync(process.execPath, ["-e", "process.stdout.write(String(process.pid))"], { encoding: "utf8" });
+      writeFileSync(join(profile, OWNER_FILE), JSON.stringify({ ownerPid: Number(dead.stdout), ownerStartedAt: Date.now() - 60_000, chromePid: orphan_pid, userDataDirArg: arg }));
+      client = await start_client(["--user-data-dir", profile, "--allowed-domains", "127.0.0.1"]);
+      out = await client.tool("navigate", { url: `${server.origin}/products` });
+      assert.equal(out.isError, false, out.text);
+      assert.match(out.text, /Page: Products/);
+      assert.throws(() => process.kill(orphan_pid, 0), "orphan was killed");
+      const owner = JSON.parse(readFileSync(join(profile, OWNER_FILE), "utf8"));
+      assert.equal(owner.ownerPid, client.child.pid, "the new server now owns the profile");
+    } finally {
+      await client?.stop();
+      if (orphan.pid) {
+        try {
+          process.kill(orphan.pid);
+        } catch {
+          // gone
+        }
+      }
+      await server.close();
+      rmSync(profile, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+    }
+  });
+});
+
 async function find_chrome_pid(profile: string): Promise<number | null> {
   const { execSync } = await import("node:child_process");
   if (process.platform === "win32") {

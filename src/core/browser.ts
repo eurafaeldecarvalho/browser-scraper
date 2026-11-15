@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { closeSync, existsSync, openSync, readlinkSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readlinkSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -106,6 +106,123 @@ export function profileInUse(dir: string): string | null {
     return `pid ${pid}`;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM" ? "another user's process" : null;
+  }
+}
+
+// Sidecar written into a persistent profile while this library's Chrome runs
+// on it: who owns that Chrome (the Node process + its start time) and which
+// Chrome it is. Lets the NEXT launch tell an orphan (owner hard-killed, e.g.
+// TerminateProcess on Windows, which no exit handler can catch) from a profile
+// that is legitimately in use.
+export const OWNER_FILE = "browser-scraper.owner.json";
+
+export type ProfileOwner = {
+  ownerPid: number;
+  ownerStartedAt: number;
+  chromePid: number;
+  userDataDirArg: string;
+};
+
+type ProcInfo = { startedAt: number | null; commandLine: string };
+
+// Start time (ms epoch) + command line of a live pid, or null when it is gone.
+// No native deps: PowerShell/CIM on Windows, ps elsewhere.
+export function processInfo(pid: number): ProcInfo | null {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EPERM") {
+      return null;
+    }
+  }
+  try {
+    if (process.platform === "win32") {
+      const script = `$p = Get-CimInstance Win32_Process -Filter "ProcessId=${pid}"; if ($p) { [Console]::Out.Write([string]([DateTimeOffset]$p.CreationDate).ToUnixTimeMilliseconds() + [char]10 + $p.CommandLine) }`;
+      const res = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", windowsHide: true, timeout: 15_000 });
+      const out = String(res.stdout ?? "");
+      if (res.status !== 0 || !out) {
+        return res.status === 0 ? null : { startedAt: null, commandLine: "" };
+      }
+      const nl = out.indexOf("\n");
+      const started = Number(out.slice(0, nl));
+      return { startedAt: Number.isFinite(started) ? started : null, commandLine: out.slice(nl + 1) };
+    }
+    const res = spawnSync("ps", ["-o", "lstart=", "-o", "args=", "-p", String(pid)], { encoding: "utf8", timeout: 5_000 });
+    const line = String(res.stdout ?? "").trim();
+    if (!line) {
+      return null;
+    }
+    // lstart is a fixed 24-char "Mon Nov 15 14:58:16 2026".
+    const started = Date.parse(line.slice(0, 24));
+    return { startedAt: Number.isFinite(started) ? started : null, commandLine: line.slice(24).trim() };
+  } catch {
+    return { startedAt: null, commandLine: "" };
+  }
+}
+
+export function readProfileOwner(dir: string): ProfileOwner | null {
+  try {
+    const data = JSON.parse(readFileSync(join(dir, OWNER_FILE), "utf8"));
+    if (Number.isInteger(data?.ownerPid) && Number.isInteger(data?.chromePid) && typeof data?.ownerStartedAt === "number" && typeof data?.userDataDirArg === "string") {
+      return data as ProfileOwner;
+    }
+  } catch {
+    // missing or malformed
+  }
+  return null;
+}
+
+// Start-time tolerance when matching a recorded owner against a live pid
+// (process.uptime-derived vs OS-reported creation time).
+const OWNER_START_TOLERANCE_MS = 5_000;
+
+// Returns the orphan Chrome pid on `dir` when (and only when) it is provably
+// ours and its owner is dead: the sidecar names an owner process that is gone
+// (or whose pid was reused by a process started at another time), and the
+// recorded Chrome pid is alive with OUR --user-data-dir on its command line and
+// is the browser process (not a --type= helper). Anything uncertain → null, so
+// a Chrome whose server is alive, or the user's own Chrome, is never touched.
+export function findOrphanChrome(dir: string, info: (pid: number) => ProcInfo | null = processInfo): number | null {
+  const owner = readProfileOwner(dir);
+  if (!owner || owner.ownerPid === process.pid) {
+    return null;
+  }
+  const server = info(owner.ownerPid);
+  if (server) {
+    if (server.startedAt === null || Math.abs(server.startedAt - owner.ownerStartedAt) <= OWNER_START_TOLERANCE_MS) {
+      return null; // owner alive (or can't tell): never kill
+    }
+  }
+  const chrome = info(owner.chromePid);
+  if (!chrome || !chrome.commandLine) {
+    return null;
+  }
+  const cmd = process.platform === "win32" ? chrome.commandLine.toLowerCase() : chrome.commandLine;
+  const arg = process.platform === "win32" ? owner.userDataDirArg.toLowerCase() : owner.userDataDirArg;
+  if (!cmd.includes(arg) || /--type=/.test(cmd)) {
+    return null;
+  }
+  // Exact arg match: "--user-data-dir=C:\\p" must not match "--user-data-dir=C:\\p2".
+  const end = cmd.indexOf(arg) + arg.length;
+  const next = cmd.charAt(end);
+  if (next && !/[\s"]/.test(next)) {
+    return null;
+  }
+  return owner.chromePid;
+}
+
+function kill_tree(pid: number): void {
+  try {
+    if (process.platform === "win32") {
+      spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    } else {
+      process.kill(pid, "SIGKILL");
+    }
+  } catch {
+    // already gone
   }
 }
 
@@ -447,7 +564,20 @@ export class Browser {
     // hands the URL to the running instance and exits, which otherwise surfaces
     // as an opaque "Timeout waiting for Chrome to start".
     if (!this._temp_dir) {
-      const owner = profileInUse(this.userDataDir as string);
+      let owner = profileInUse(this.userDataDir as string);
+      if (owner) {
+        // Chrome orphaned by a hard-killed previous server on this profile:
+        // reclaim it (only when provably ours and its owner is dead).
+        const orphan = findOrphanChrome(this.userDataDir as string);
+        if (orphan) {
+          console.warn(`[browser-scraper] Killing orphaned Chrome (pid ${orphan}) left on ${this.userDataDir} by a previous server that is no longer running.`);
+          kill_tree(orphan);
+          for (let i = 0; i < 50 && owner; i++) {
+            await delay(200);
+            owner = profileInUse(this.userDataDir as string);
+          }
+        }
+      }
       if (owner) {
         throw new BrowserError(
           `The profile ${this.userDataDir} is already in use by another Chrome (${owner}). Close that browser or use a different --user-data-dir.`,
@@ -524,6 +654,8 @@ export class Browser {
       env: this._spawn_env(),
     });
     this._attach_stderr_capture();
+    this._install_exit_guard();
+    this._write_owner_file();
 
     try {
       this._ws_endpoint = await this._get_ws_endpoint();
@@ -548,6 +680,7 @@ export class Browser {
       }
       this._process = null;
       this._remove_exit_guard();
+      this._remove_owner_file();
     }
     if (this._temp_dir) {
       await rm(this._temp_dir, { recursive: true, force: true }).catch(() => {});
@@ -608,6 +741,8 @@ export class Browser {
       // it can't keep the event loop alive.
       process.stderr?.destroy();
       this._process = null;
+      this._remove_exit_guard();
+      this._remove_owner_file();
     }
 
     if (this._temp_dir) {
@@ -643,6 +778,42 @@ export class Browser {
     };
     globalThis.process.once("exit", guard);
     this._exit_guard = guard;
+  }
+
+  private _owner_file: string | null = null;
+
+  // Records (owner Node pid + start time, Chrome pid) in the persistent
+  // profile so a later launch can reclaim this Chrome if we get hard-killed.
+  private _write_owner_file(): void {
+    this._owner_file = null;
+    const pid = this._process?.pid;
+    if (this._temp_dir || !this.userDataDir || !pid) {
+      return;
+    }
+    const file = join(this.userDataDir, OWNER_FILE);
+    const owner: ProfileOwner = {
+      ownerPid: globalThis.process.pid,
+      ownerStartedAt: Math.round(Date.now() - globalThis.process.uptime() * 1000),
+      chromePid: pid,
+      userDataDirArg: `--user-data-dir=${this.userDataDir}`,
+    };
+    try {
+      writeFileSync(file, JSON.stringify(owner));
+      this._owner_file = file;
+    } catch {
+      // Best effort: without it an orphan just yields the "in use" error.
+    }
+  }
+
+  private _remove_owner_file(): void {
+    if (this._owner_file) {
+      try {
+        rmSync(this._owner_file, { force: true });
+      } catch {
+        // ignore
+      }
+      this._owner_file = null;
+    }
   }
 
   private _remove_exit_guard(): void {

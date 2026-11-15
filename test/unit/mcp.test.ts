@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { McpServer, parseEnvFile, profileInUse } from "../../src/index";
+import { findOrphanChrome, McpServer, OWNER_FILE, parseEnvFile, processInfo, profileInUse } from "../../src/index";
 import { parseKeyCombo } from "../../src/behavior/keyboard";
 import { find_option, installShutdownHandlers, read_session_file, safe_filename, wait_timeout_ms } from "../../src/mcp/server";
 import { CDPClient, runUnguarded } from "../../src/core/cdp-client";
@@ -97,6 +97,41 @@ test("find_option matches options in a snapshot, exact before partial", () => {
   assert.deepEqual(find_option(snap, "green"), { name: "Blue green", ref: "e4" });
   assert.deepEqual(find_option(snap, " delete "), { name: "Delete", ref: "e6" });
   assert.equal(find_option(snap, "red"), null);
+});
+
+test("findOrphanChrome only reclaims our Chrome when its owning server is dead", () => {
+  const dir = mkdtempSync(join(tmpdir(), "bs-owner-"));
+  const arg = `--user-data-dir=${dir}`;
+  const owner = { ownerPid: 111, ownerStartedAt: 1_000_000, chromePid: 222, userDataDirArg: arg };
+  writeFileSync(join(dir, OWNER_FILE), JSON.stringify(owner));
+  const chrome = { startedAt: 1_000_500, commandLine: `chrome.exe --flag ${arg} about:blank` };
+  const procs = (table: Record<number, { startedAt: number | null; commandLine: string } | null>) => (pid: number) => table[pid] ?? null;
+  // owner dead + our browser process alive -> orphan
+  assert.equal(findOrphanChrome(dir, procs({ 222: chrome })), 222);
+  // owner pid reused by a process started much later -> still an orphan
+  assert.equal(findOrphanChrome(dir, procs({ 111: { startedAt: 9_000_000, commandLine: "x" }, 222: chrome })), 222);
+  // owner alive (same start) -> never kill
+  assert.equal(findOrphanChrome(dir, procs({ 111: { startedAt: 1_000_200, commandLine: "node" }, 222: chrome })), null);
+  // owner alive but start time unknown -> never kill
+  assert.equal(findOrphanChrome(dir, procs({ 111: { startedAt: null, commandLine: "" }, 222: chrome })), null);
+  // chrome pid reused by the user's own Chrome on another profile -> never kill
+  assert.equal(findOrphanChrome(dir, procs({ 222: { startedAt: 1, commandLine: `chrome.exe ${arg}2 about:blank` } })), null);
+  assert.equal(findOrphanChrome(dir, procs({ 222: { startedAt: 1, commandLine: "chrome.exe --user-data-dir=C:/Other" } })), null);
+  // a helper (--type=renderer) is not the browser process
+  assert.equal(findOrphanChrome(dir, procs({ 222: { startedAt: 1, commandLine: `chrome.exe --type=renderer ${arg}` } })), null);
+  // chrome already gone, malformed or missing sidecar -> nothing to do
+  assert.equal(findOrphanChrome(dir, procs({})), null);
+  writeFileSync(join(dir, OWNER_FILE), "{not json");
+  assert.equal(findOrphanChrome(dir, procs({ 222: chrome })), null);
+  rmSync(join(dir, OWNER_FILE));
+  assert.equal(findOrphanChrome(dir, procs({ 222: chrome })), null);
+});
+
+test("processInfo reports this process and null for a dead pid", () => {
+  const me = processInfo(process.pid);
+  assert.ok(me && me.startedAt !== null);
+  assert.ok(Math.abs((me.startedAt as number) - (Date.now() - process.uptime() * 1000)) < 5_000);
+  assert.equal(processInfo(2 ** 22 + 12345), null);
 });
 
 test("profileInUse is null for a free or missing profile", () => {

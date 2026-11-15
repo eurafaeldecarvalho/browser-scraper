@@ -1,0 +1,6 @@
+# Store and check out text as LF on every OS (autocrlf would otherwise mix CRLF in).
+* text=auto eol=lf
+*.gif binary
+*.png binary
+*.jpg binary
+*.ico binary
