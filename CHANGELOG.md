@@ -4,6 +4,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11-15
+
 ### Added
 - **MCP agent tools (token-efficient, hard UIs):** `find` (elements by text/regex and/or role with refs and context, no full snapshot), `element_info`, `click_at` (viewport coordinates), `drag` (sliders, sortable lists, HTML5 drag-and-drop), `drop_files` (local media into drop zones/post composers as a real browser drag of files, or as a paste), `network_requests` / `response_body` / `wait_for_response` (read the JSON an action loaded), `cookies` (get/set/delete within `--allowed-domains`), `save_pdf`, `emulate` (geolocation, timezone, locale for every tab), `solve_captcha` (reCAPTCHA v2 / hCaptcha checkbox; an image challenge comes back as a screenshot + box for vision + `click_at`), `batch` (several calls in one round-trip, one page state at the end), `browser_status` (health check that never relaunches). `click` takes `button` (right/middle) and `doubleClick`.
 - MCP `--snapshot-mode full|diff|none` (`snapshotMode`): what actions return. `snapshot` takes `diff: true`.
