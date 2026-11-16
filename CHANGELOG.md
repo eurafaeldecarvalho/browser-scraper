@@ -4,6 +4,12 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-11-15
+
+### Fixed
+- MCP path arguments (`save_pdf`, `export_session`/`import_session`, `upload_file`, `drop_files`): UNC/device paths (`\\\\host\\share`, `//host`, `\\\\?\\…`) are now refused with "Network/device paths are not allowed" on every OS, before the absolute-path check (on Linux/macOS they were reported as non-absolute instead).
+- MCP tool timeout: the per-call timeout timer is no longer `unref`'d, so a call stuck on a frozen page always times out instead of the process exiting with the call pending (made unit tests fail on Node 22).
+
 ## [0.9.0] — 2026-11-15
 
 ### Added

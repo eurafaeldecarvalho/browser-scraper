@@ -328,8 +328,10 @@ export class McpServer {
     let timer: NodeJS.Timeout | undefined;
     const timed_out = new Error(`${tool.name} did not finish within ${Math.round(limit / 1_000)}s (the page may be frozen). Try snapshot, reload or close_tab.`);
     const timeout = new Promise<never>((_, reject) => {
+      // Not unref'd: it is always cleared in `finally`, and an unref'd timer
+      // racing a never-settling call would leave nothing keeping the event loop
+      // alive, so the process could exit before the timeout fires.
       timer = setTimeout(() => reject(timed_out), limit);
-      timer.unref?.();
     });
     const generation = this._generation;
     this._call_seq++;
@@ -1901,6 +1903,7 @@ export class McpServer {
   // able to overwrite arbitrary files with it).
   private _session_path(value: unknown): string {
     const raw = String(value ?? "");
+    refuse_network_path(raw);
     if (!raw || !isAbsolute(raw)) {
       throw new Error(`path must be an absolute file path (got "${raw}").`);
     }
@@ -2543,6 +2546,7 @@ ${await this._page_state(tab)}`);
           if (raw.length === 0) {
             throw new Error("paths is empty.");
           }
+          raw.forEach(refuse_network_path);
           const relative = raw.find((path) => !isAbsolute(path));
           if (relative !== undefined) {
             throw new Error(`Paths must be absolute (got "${relative}").`);
@@ -3043,6 +3047,7 @@ ${this._untrusted(this._clip_redacted(js[1], 2_000))}`);
           if (raw.length === 0) {
             throw new Error("paths is empty.");
           }
+          raw.forEach(refuse_network_path);
           const relative = raw.find((path) => !isAbsolute(path));
           if (relative !== undefined) {
             throw new Error(`Paths must be absolute (got "${relative}").`);
@@ -3303,6 +3308,7 @@ ${this._untrusted(this._clip_redacted(js[1], 2_000))}`);
           let path: string;
           if (args.path) {
             const raw = String(args.path);
+            refuse_network_path(raw);
             if (!isAbsolute(raw) || extname(raw).toLowerCase() !== ".pdf") {
               throw new Error(`path must be an absolute .pdf file path (got "${raw}").`);
             }
@@ -3632,11 +3638,18 @@ type Box = { x: number; y: number; width: number; height: number };
 // \\?\..., \\.\...) are refused BEFORE any fs call: on Windows merely stat-ing
 // \\attacker\x makes the OS authenticate to that host over SMB (NTLM hash
 // leak), and a hostile page can talk the agent into such a path.
-export function local_path(raw: string): string {
+// Platform-independent: must run before isAbsolute(), which on POSIX treats
+// \\host\share as relative and would otherwise mask this clearer error.
+export function refuse_network_path(raw: string): void {
   const value = String(raw);
   if (/^[\\/]{2}/.test(value) || /^[\\/][?.][\\/]/.test(value)) {
     throw new Error(`Network/device paths are not allowed (got "${value}"); use a path on a local disk.`);
   }
+}
+
+export function local_path(raw: string): string {
+  const value = String(raw);
+  refuse_network_path(value);
   const path = resolve_path(value);
   if (/^[\\/]{2}/.test(path)) {
     throw new Error(`Network/device paths are not allowed (got "${value}"); use a path on a local disk.`);
@@ -3983,6 +3996,7 @@ type SessionFile = { cookies: SessionCookie[]; origins: Record<string, { localSt
 // Reads and validates a file written by export_session; every malformed input
 // becomes a clear error instead of a TypeError or a raw CDP failure.
 export function read_session_file(raw_path: string): SessionFile {
+  refuse_network_path(raw_path);
   if (!raw_path || !isAbsolute(raw_path)) {
     throw new Error(`path must be an absolute file path (got "${raw_path}").`);
   }
