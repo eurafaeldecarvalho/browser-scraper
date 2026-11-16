@@ -55,3 +55,16 @@ test("secret_forms covers base64 at any offset, strict percent-encoding and ASCI
   assert.ok(forms.includes("S3cr3t!p\\u00E4ssw(rd)"));
   assert.deepEqual(base64_cores("short"), []);
 });
+
+test("_redact computes secret forms once and stays fast per snapshot node", async () => {
+  const { McpServer } = await import("../../src/mcp/server");
+  const server = new McpServer({ secrets: { A: "123456", B: "S3cr3t!pässw(rd)'*", C: "hunter2" } });
+  const redact = (t: string) => (server as any)._redact(t);
+  assert.equal(redact("x S3cr3t!pässw(rd)'* y 123456"), "x {{B}} y {{A}}");
+  const pairs = (server as any)._redaction_pairs();
+  assert.equal((server as any)._redaction_pairs(), pairs);
+  const t0 = performance.now();
+  for (let i = 0; i < 20000; i++) redact(`link item number ${i} Mozilla`);
+  assert.ok(performance.now() - t0 < 1500, "20k node names must redact well under 1.5 s");
+  assert.equal(redact("plain README text with no secret"), "plain README text with no secret");
+});

@@ -673,13 +673,32 @@ export class McpServer {
     });
   }
 
+  // Secret forms are computed once per secrets object: snapshot redacts every
+  // accessibility node, and recomputing ~40 encodings per node made snapshots
+  // of large pages several times slower with --secrets.
+  private _redaction_cache: { secrets: Record<string, string> | undefined; pairs: Array<[string, string]> } | null = null;
+
+  private _redaction_pairs(): Array<[string, string]> {
+    const secrets = this._options.secrets;
+    if (!this._redaction_cache || this._redaction_cache.secrets !== secrets) {
+      const pairs: Array<[string, string]> = [];
+      for (const [name, value] of Object.entries(secrets ?? {})) {
+        if (value && value.length >= 3) {
+          for (const form of secret_forms(value)) {
+            pairs.push([form, `{{${name}}}`]);
+          }
+        }
+      }
+      this._redaction_cache = { secrets, pairs };
+    }
+    return this._redaction_cache.pairs;
+  }
+
   private _redact(text: string): string {
     let out = text;
-    for (const [name, value] of Object.entries(this._options.secrets ?? {})) {
-      if (value && value.length >= 3) {
-        for (const form of secret_forms(value)) {
-          out = out.split(form).join(`{{${name}}}`);
-        }
+    for (const [form, placeholder] of this._redaction_pairs()) {
+      if (out.includes(form)) {
+        out = out.split(form).join(placeholder);
       }
     }
     return out;
